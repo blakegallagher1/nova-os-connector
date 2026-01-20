@@ -13,6 +13,8 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.13.1",
     "@modelcontextprotocol/server-github": "^2025.1.13",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.1",
     "@vercel/sdk": "^1.18.7",
     "dotenv": "^17.2.3",
     "express": "^4.19.2",
@@ -20,8 +22,6 @@
     "zod": "^3.25.6"
   },
   "devDependencies": {
-    "@types/express": "^4.17.21",
-    "@types/node": "^22.10.1",
     "tsx": "^4.19.1"
   },
   "engines": {
