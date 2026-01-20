@@ -1436,49 +1436,70 @@ async function main(): Promise<void> {
   console.log(`  - Max entries:      ${CACHE_MAX_ENTRIES}`);
   console.log('');
 
-  // Connect to GitHub MCP server
-  await connectToGitHub();
+  // Start server FIRST so health checks work even if GitHub connection fails
+  await new Promise<void>((resolve) => {
+    app.listen(PORT, () => {
+      console.log(`Server listening on port ${PORT}`);
+      console.log('');
+      console.log('Endpoints:');
+      console.log(`  - MCP:    http://localhost:${PORT}/mcp`);
+      console.log(`  - Health: http://localhost:${PORT}/health`);
+      console.log('');
+      resolve();
+    });
+  });
 
-  // Register all tools
-  registerProxiedTools();
-  registerBatchReadFiles();
-  registerValidateBuild();
-  registerVercelTools();
-  registerGitHubRateLimitTool();
-  registerCacheTool();
+  // Connect to GitHub MCP server (non-blocking, will retry on failure)
+  try {
+    await connectToGitHub();
 
-  // Calculate tool counts (base + custom tools)
-  // Custom: batch_read_files, validate_build, check_github_rate_limit, clear_cache + 3 vercel tools if available
-  const customTools = 4 + (vercel ? 3 : 0);
-  const customReadOnly = 3 + (vercel ? 3 : 0); // all custom read-only tools (clear_cache is not read-only)
+    // Register all tools after successful connection
+    registerProxiedTools();
+    registerBatchReadFiles();
+    registerValidateBuild();
+    registerVercelTools();
+    registerGitHubRateLimitTool();
+    registerCacheTool();
 
-  console.log('');
-  console.log(`Total tools registered: ${state.tools.length + customTools}`);
-  console.log(`  - Read-only tools: ${state.tools.filter((t) => READ_ONLY_TOOLS.has(t.name)).length + customReadOnly}`);
-  console.log(`  - Idempotent tools: ${state.tools.filter((t) => IDEMPOTENT_TOOLS.has(t.name)).length + customReadOnly}`);
-  console.log(`  - Write tools: ${state.tools.filter((t) => !READ_ONLY_TOOLS.has(t.name)).length}`);
-  if (vercel) {
-    console.log('  - Vercel tools: 3 (list_vercel_deployments, get_vercel_deployment, get_vercel_build_logs)');
+    // Calculate tool counts (base + custom tools)
+    // Custom: batch_read_files, validate_build, check_github_rate_limit, clear_cache + 3 vercel tools if available
+    const customTools = 4 + (vercel ? 3 : 0);
+    const customReadOnly = 3 + (vercel ? 3 : 0); // all custom read-only tools (clear_cache is not read-only)
+
+    console.log('');
+    console.log(`Total tools registered: ${state.tools.length + customTools}`);
+    console.log(`  - Read-only tools: ${state.tools.filter((t) => READ_ONLY_TOOLS.has(t.name)).length + customReadOnly}`);
+    console.log(`  - Idempotent tools: ${state.tools.filter((t) => IDEMPOTENT_TOOLS.has(t.name)).length + customReadOnly}`);
+    console.log(`  - Write tools: ${state.tools.filter((t) => !READ_ONLY_TOOLS.has(t.name)).length}`);
+    if (vercel) {
+      console.log('  - Vercel tools: 3 (list_vercel_deployments, get_vercel_deployment, get_vercel_build_logs)');
+    }
+    console.log('');
+  } catch (error) {
+    console.error('[wrapper] Initial GitHub connection failed, will retry in background:', error);
+    // Schedule a background reconnect
+    setTimeout(() => {
+      reconnectToGitHub().then(() => {
+        // Register tools after reconnect
+        registerProxiedTools();
+        registerBatchReadFiles();
+        registerValidateBuild();
+        registerVercelTools();
+        registerGitHubRateLimitTool();
+        registerCacheTool();
+        console.log('[wrapper] Tools registered after reconnection');
+      }).catch((e) => console.error('[wrapper] Background reconnect failed:', e));
+    }, 5000);
   }
-  console.log('');
 
   // Start health check interval
   setInterval(() => {
     healthCheck().catch((e) => console.error('[wrapper] Health check error:', e));
   }, HEALTH_CHECK_INTERVAL_MS);
 
-  // Start server
-  app.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
-    console.log('');
-    console.log('Endpoints:');
-    console.log(`  - MCP:    http://localhost:${PORT}/mcp`);
-    console.log(`  - Health: http://localhost:${PORT}/health`);
-    console.log('');
-    console.log('Cloudflare Tunnel URL:');
-    console.log('  https://nova-connector.gallagherpropco.com/mcp');
-    console.log('');
-  });
+  console.log('Render URL:');
+  console.log('  https://nova-os-connector.onrender.com/mcp');
+  console.log('');
 }
 
 // Graceful shutdown
