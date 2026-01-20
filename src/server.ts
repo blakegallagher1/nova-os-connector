@@ -428,9 +428,13 @@ async function connectToGitHub(): Promise<void> {
       }
     }
 
+    // Use local bin when installed, fallback to npx for development
+    const mcpServerPath = path.join(process.cwd(), 'node_modules', '.bin', 'mcp-server-github');
+    const useLocalBin = await fs.access(mcpServerPath).then(() => true).catch(() => false);
+
     state.transport = new StdioClientTransport({
-      command: 'npx',
-      args: ['-y', '@modelcontextprotocol/server-github'],
+      command: useLocalBin ? mcpServerPath : 'npx',
+      args: useLocalBin ? [] : ['-y', '@modelcontextprotocol/server-github'],
       env: {
         ...process.env,
         GITHUB_PERSONAL_ACCESS_TOKEN: GITHUB_TOKEN,
