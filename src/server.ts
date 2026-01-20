@@ -1450,47 +1450,45 @@ async function main(): Promise<void> {
     });
   });
 
-  // Connect to GitHub MCP server (non-blocking, will retry on failure)
-  try {
-    await connectToGitHub();
+  // Register custom tools (no GitHub MCP dependency)
+  // These tools work independently and don't require the MCP child process
+  registerValidateBuild();
+  registerVercelTools();
+  registerGitHubRateLimitTool();
+  registerCacheTool();
 
-    // Register all tools after successful connection
-    registerProxiedTools();
-    registerBatchReadFiles();
-    registerValidateBuild();
-    registerVercelTools();
-    registerGitHubRateLimitTool();
-    registerCacheTool();
+  // Try to connect to GitHub MCP server for additional tools (optional)
+  // Set SKIP_GITHUB_MCP=1 to skip this and only use custom tools
+  const skipGitHubMCP = process.env.SKIP_GITHUB_MCP === '1';
 
-    // Calculate tool counts (base + custom tools)
-    // Custom: batch_read_files, validate_build, check_github_rate_limit, clear_cache + 3 vercel tools if available
-    const customTools = 4 + (vercel ? 3 : 0);
-    const customReadOnly = 3 + (vercel ? 3 : 0); // all custom read-only tools (clear_cache is not read-only)
-
-    console.log('');
-    console.log(`Total tools registered: ${state.tools.length + customTools}`);
-    console.log(`  - Read-only tools: ${state.tools.filter((t) => READ_ONLY_TOOLS.has(t.name)).length + customReadOnly}`);
-    console.log(`  - Idempotent tools: ${state.tools.filter((t) => IDEMPOTENT_TOOLS.has(t.name)).length + customReadOnly}`);
-    console.log(`  - Write tools: ${state.tools.filter((t) => !READ_ONLY_TOOLS.has(t.name)).length}`);
+  if (skipGitHubMCP) {
+    console.log('[wrapper] SKIP_GITHUB_MCP=1, skipping GitHub MCP connection');
+    console.log('[wrapper] Available tools: validate_build, check_github_rate_limit, clear_cache');
     if (vercel) {
-      console.log('  - Vercel tools: 3 (list_vercel_deployments, get_vercel_deployment, get_vercel_build_logs)');
+      console.log('[wrapper] + Vercel tools: list_vercel_deployments, get_vercel_deployment, get_vercel_build_logs');
     }
-    console.log('');
-  } catch (error) {
-    console.error('[wrapper] Initial GitHub connection failed, will retry in background:', error);
-    // Schedule a background reconnect
-    setTimeout(() => {
-      reconnectToGitHub().then(() => {
-        // Register tools after reconnect
-        registerProxiedTools();
-        registerBatchReadFiles();
-        registerValidateBuild();
-        registerVercelTools();
-        registerGitHubRateLimitTool();
-        registerCacheTool();
-        console.log('[wrapper] Tools registered after reconnection');
-      }).catch((e) => console.error('[wrapper] Background reconnect failed:', e));
-    }, 5000);
+  } else {
+    try {
+      console.log('[wrapper] Attempting to connect to GitHub MCP server...');
+      await connectToGitHub();
+
+      // Register GitHub MCP tools after successful connection
+      registerProxiedTools();
+      registerBatchReadFiles();
+
+      const totalTools = state.tools.length + 4 + (vercel ? 3 : 0);
+      console.log('');
+      console.log(`Total tools registered: ${totalTools}`);
+      console.log(`  - GitHub MCP tools: ${state.tools.length}`);
+      console.log(`  - Custom tools: ${4 + (vercel ? 3 : 0)}`);
+      console.log('');
+    } catch (error) {
+      console.error('[wrapper] GitHub MCP connection failed (server will continue with custom tools only):', error);
+      console.log('[wrapper] Available tools: validate_build, check_github_rate_limit, clear_cache');
+      if (vercel) {
+        console.log('[wrapper] + Vercel tools: list_vercel_deployments, get_vercel_deployment, get_vercel_build_logs');
+      }
+    }
   }
 
   // Start health check interval
