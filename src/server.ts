@@ -428,13 +428,12 @@ async function connectToGitHub(): Promise<void> {
       }
     }
 
-    // Use local bin when installed, fallback to npx for development
-    const mcpServerPath = path.join(process.cwd(), 'node_modules', '.bin', 'mcp-server-github');
-    const useLocalBin = await fs.access(mcpServerPath).then(() => true).catch(() => false);
+    console.log('[wrapper] Attempting to connect to GitHub MCP server...');
 
+    // Use npx to run the MCP server
     state.transport = new StdioClientTransport({
-      command: useLocalBin ? mcpServerPath : 'npx',
-      args: useLocalBin ? [] : ['-y', '@modelcontextprotocol/server-github'],
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-github'],
       env: {
         ...process.env,
         GITHUB_PERSONAL_ACCESS_TOKEN: GITHUB_TOKEN,
@@ -446,7 +445,9 @@ async function connectToGitHub(): Promise<void> {
       version: '3.0.0',
     });
 
+    console.log('[wrapper] Connecting to transport...');
     await state.client.connect(state.transport);
+    console.log('[wrapper] Transport connected successfully');
 
     // Fetch available tools
     const toolsResult = await state.client.listTools();

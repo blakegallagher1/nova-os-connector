@@ -4,7 +4,8 @@
   "description": "GitHub MCP Server Wrapper for Nova OS - ChatGPT Connector with tool annotations and batch operations",
   "type": "module",
   "scripts": {
-    "start": "node dist/server.js",
+    "start": "node dist/server-minimal.js",
+    "start:full": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
     "build": "tsc --skipLibCheck",
     "start:ts": "tsx src/server.ts",
