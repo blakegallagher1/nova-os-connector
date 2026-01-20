@@ -341,7 +341,7 @@ async function fetchGitHubRateLimit(): Promise<RateLimitState> {
     });
 
     if (response.ok) {
-      const data = await response.json();
+      const data = await response.json() as { resources?: { core?: any }; rate?: any };
       const core = data.resources?.core || data.rate;
 
       rateLimitState.remaining = core.remaining;
@@ -1124,7 +1124,7 @@ function registerVercelTools(): void {
         const deployment = await vercel.deployments.getDeployment({ idOrUrl: deploymentId });
 
         const result = {
-          id: deployment.uid,
+          id: (deployment as any).uid || deployment.id,
           name: deployment.name,
           url: deployment.url ? `https://${deployment.url}` : null,
           state: deployment.readyState,
@@ -1255,7 +1255,7 @@ function registerGitHubRateLimitTool(): void {
           throw new Error(`GitHub API error: ${response.status}`);
         }
 
-        const data = await response.json();
+        const data = await response.json() as { resources?: { core?: any; search?: any }; rate?: any };
 
         // Update our internal state
         const core = data.resources?.core || data.rate;
