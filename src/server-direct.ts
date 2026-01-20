@@ -8,7 +8,6 @@ import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { Vercel } from '@vercel/sdk';
 
 const execAsync = promisify(exec);
 
@@ -19,8 +18,6 @@ const execAsync = promisify(exec);
 const PORT = parseInt(process.env.PORT || '8000', 10);
 const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
 const VERCEL_TOKEN = process.env.VERCEL_TOKEN;
-
-const vercel = VERCEL_TOKEN ? new Vercel({ bearerToken: VERCEL_TOKEN }) : null;
 
 if (!GITHUB_TOKEN) {
   console.error('ERROR: GITHUB_PERSONAL_ACCESS_TOKEN is required');
@@ -752,8 +749,27 @@ server.registerTool(
   }
 );
 
+// Vercel API helper
+async function vercelAPI(endpoint: string, options: RequestInit = {}): Promise<any> {
+  if (!VERCEL_TOKEN) throw new Error('VERCEL_TOKEN not configured');
+  const url = `https://api.vercel.com${endpoint}`;
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Authorization': `Bearer ${VERCEL_TOKEN}`,
+      'Content-Type': 'application/json',
+      ...options.headers,
+    },
+  });
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Vercel API error ${response.status}: ${error}`);
+  }
+  return response.json();
+}
+
 // Vercel tools
-if (vercel) {
+if (VERCEL_TOKEN) {
   server.registerTool(
     'list_vercel_deployments',
     {
@@ -766,10 +782,10 @@ if (vercel) {
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectId, limit }) => {
-      const params: any = { limit: Math.min(limit || 10, 100) };
-      if (projectId) params.projectId = projectId;
+      let url = `/v6/deployments?limit=${Math.min(limit || 10, 100)}`;
+      if (projectId) url += `&projectId=${projectId}`;
 
-      const response = await vercel.deployments.getDeployments(params);
+      const response = await vercelAPI(url);
 
       return {
         content: [{
@@ -798,18 +814,18 @@ if (vercel) {
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ deploymentId }) => {
-      const d = await vercel.deployments.getDeployment({ idOrUrl: deploymentId });
+      const d = await vercelAPI(`/v13/deployments/${deploymentId}`);
 
       return {
         content: [{
           type: 'text' as const,
           text: JSON.stringify({
-            id: (d as any).uid || d.id,
+            id: d.uid || d.id,
             name: d.name,
             state: d.readyState,
             url: d.url ? `https://${d.url}` : null,
-            errorCode: (d as any).errorCode || null,
-            errorMessage: (d as any).errorMessage || null,
+            errorCode: d.errorCode || null,
+            errorMessage: d.errorMessage || null,
           }, null, 2),
         }],
       };
@@ -827,9 +843,9 @@ app.use(express.json({ limit: '10mb' }));
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
-    tools: 13 + (vercel ? 2 : 0),
+    tools: 13 + (VERCEL_TOKEN ? 2 : 0),
     cache: cache.getStats(),
-    vercelEnabled: !!vercel,
+    vercelEnabled: !!VERCEL_TOKEN,
     version: '4.0.0',
   });
 });
@@ -865,7 +881,7 @@ console.log('  Nova OS GitHub Connector v4');
 console.log('  (Direct API - No Child Processes)');
 console.log('========================================');
 console.log('');
-console.log(`Tools: 13 GitHub + ${vercel ? '2 Vercel + ' : ''}3 utility = ${13 + (vercel ? 2 : 0) + 3} total`);
+console.log(`Tools: 13 GitHub + ${VERCEL_TOKEN ? '2 Vercel + ' : ''}3 utility = ${13 + (VERCEL_TOKEN ? 2 : 0) + 3} total`);
 console.log('');
 
 app.listen(PORT, () => {
