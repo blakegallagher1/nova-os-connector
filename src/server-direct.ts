@@ -3253,6 +3253,15 @@ app.get('/health', (_req, res) => {
 
 app.post('/mcp', async (req, res) => {
   try {
+    if (req.body?.method === 'resources/list') {
+      res.json({
+        jsonrpc: '2.0',
+        id: req.body?.id ?? null,
+        result: { resources: [] },
+      });
+      return;
+    }
+
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

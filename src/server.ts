@@ -1382,6 +1382,15 @@ app.get('/health', (_req, res) => {
 
 app.post('/mcp', async (req, res) => {
   try {
+    if (req.body?.method === 'resources/list') {
+      res.json({
+        jsonrpc: '2.0',
+        id: req.body?.id ?? null,
+        result: { resources: [] },
+      });
+      return;
+    }
+
     // Check connection before handling request
     if (!state.isConnected && !state.isConnecting) {
       console.log('[wrapper] Connection lost, attempting reconnect...');
