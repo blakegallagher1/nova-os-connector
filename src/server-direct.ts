@@ -1042,7 +1042,7 @@ function parseFilesInput(
 
 const server = new McpServer({
   name: 'nova-os-github-connector',
-  version: '4.3.1',
+  version: '4.3.2',
   description: 'Direct GitHub API connector for Nova OS with dynamic toolsets',
 });
 
@@ -2007,9 +2007,10 @@ Quick mode is optimized for serverless timeouts and catches most TypeScript erro
       const installStart = Date.now();
       try {
         // Use npm ci with flags for speed: ignore scripts, prefer offline cache
+        // 120s timeout for monorepos with many packages
         await execAsync(
           'npm ci --ignore-scripts --prefer-offline --no-audit --no-fund 2>&1 || npm install --ignore-scripts --prefer-offline --no-audit --no-fund 2>&1',
-          { cwd: tempDir, timeout: 60000 }
+          { cwd: tempDir, timeout: 120000 }
         );
         steps.push({ step: 'install', status: 'success', durationMs: Date.now() - installStart });
       } catch (error: any) {
@@ -2231,7 +2232,7 @@ app.get('/health', (_req, res) => {
   const toolsetStats = toolsetManager.getStats();
   res.json({
     status: 'ok',
-    version: '4.3.1',
+    version: '4.3.2',
     toolsets: toolsetStats,
     cache: cache.getStats(),
     requestQueue: requestQueue.getStats(),
