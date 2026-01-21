@@ -1042,7 +1042,7 @@ function parseFilesInput(
 
 const server = new McpServer({
   name: 'nova-os-github-connector',
-  version: '4.3.0',
+  version: '4.3.1',
   description: 'Direct GitHub API connector for Nova OS with dynamic toolsets',
 });
 
@@ -1956,18 +1956,26 @@ server.registerTool(
   'validate_build',
   {
     title: 'Validate Build',
-    description: `Clone a repository and run the build to verify it compiles. Uses configurable build command (default: "${BUILD_COMMAND}"). [Read-Only]`,
+    description: `Validate a repository's TypeScript compilation.
+
+Modes:
+- "quick" (default): Fast typecheck only (tsc --noEmit) - completes in ~20-30s
+- "full": Full build with npm run build - may timeout on large repos
+
+Quick mode is optimized for serverless timeouts and catches most TypeScript errors.`,
     inputSchema: {
       owner: z.string().describe('Repository owner'),
       repo: z.string().describe('Repository name'),
-      branch: z.string().optional().describe('Branch name'),
-      build_command: z.string().optional().describe(`Custom build command (default: "${BUILD_COMMAND}")`),
+      branch: z.string().optional().describe('Branch name (default: main)'),
+      mode: z.enum(['quick', 'full']).optional().describe('Validation mode: "quick" (typecheck only, default) or "full" (complete build)'),
     },
     annotations: { readOnlyHint: true, idempotentHint: true },
   },
-  async ({ owner, repo, branch, build_command }) => {
+  async ({ owner, repo, branch, mode }) => {
     const branchName = branch || 'main';
-    const buildCmd = build_command || BUILD_COMMAND;
+    const validationMode = mode || 'quick';
+    const startTime = Date.now();
+
     // Use authenticated HTTPS URL for private repos
     const repoUrl = GITHUB_TOKEN
       ? `https://x-access-token:${GITHUB_TOKEN}@github.com/${owner}/${repo}.git`
@@ -1976,35 +1984,77 @@ server.registerTool(
 
     let success = false;
     let errorSummary = '';
-    let buildOutput = '';
+    let output = '';
+    const steps: Array<{ step: string; status: string; durationMs?: number }> = [];
 
     try {
       await fs.mkdir(tempDir, { recursive: true });
 
-      // Clone
-      await execAsync(`git clone --depth 1 --branch ${branchName} ${repoUrl} .`, { cwd: tempDir, timeout: 120000 });
-
-      // Install
-      await execAsync('npm ci --prefer-offline 2>&1 || npm install 2>&1', { cwd: tempDir, timeout: 300000 });
-
-      // Build (using configurable command)
+      // Step 1: Clone (shallow, single branch for speed)
+      const cloneStart = Date.now();
       try {
-        const result = await execAsync(`${buildCmd} 2>&1`, { cwd: tempDir, timeout: 300000, maxBuffer: 10 * 1024 * 1024 });
-        buildOutput = result.stdout + result.stderr;
-        success = true;
-      } catch (error: any) {
-        buildOutput = error.stdout + error.stderr;
-        const errorLines = buildOutput.split('\n').filter((line: string) =>
-          line.includes('Error:') || line.includes('error TS') || line.includes('Module not found')
+        await execAsync(
+          `git clone --depth 1 --single-branch --branch ${branchName} ${repoUrl} .`,
+          { cwd: tempDir, timeout: 30000 }
         );
-        errorSummary = errorLines.slice(0, 20).join('\n');
+        steps.push({ step: 'clone', status: 'success', durationMs: Date.now() - cloneStart });
+      } catch (error: any) {
+        steps.push({ step: 'clone', status: 'failed', durationMs: Date.now() - cloneStart });
+        throw new Error(`Clone failed: ${error.message}`);
+      }
+
+      // Step 2: Install dependencies (fast mode with ignore-scripts)
+      const installStart = Date.now();
+      try {
+        // Use npm ci with flags for speed: ignore scripts, prefer offline cache
+        await execAsync(
+          'npm ci --ignore-scripts --prefer-offline --no-audit --no-fund 2>&1 || npm install --ignore-scripts --prefer-offline --no-audit --no-fund 2>&1',
+          { cwd: tempDir, timeout: 60000 }
+        );
+        steps.push({ step: 'install', status: 'success', durationMs: Date.now() - installStart });
+      } catch (error: any) {
+        steps.push({ step: 'install', status: 'failed', durationMs: Date.now() - installStart });
+        throw new Error(`Install failed: ${error.message}`);
+      }
+
+      // Step 3: Validate (typecheck or full build based on mode)
+      const validateStart = Date.now();
+      const validateCmd = validationMode === 'quick'
+        ? 'npx tsc --noEmit 2>&1 || npm run typecheck 2>&1'
+        : `${BUILD_COMMAND} 2>&1`;
+
+      try {
+        const result = await execAsync(validateCmd, {
+          cwd: tempDir,
+          timeout: validationMode === 'quick' ? 45000 : 120000,
+          maxBuffer: 5 * 1024 * 1024,
+        });
+        output = (result.stdout || '') + (result.stderr || '');
+        success = true;
+        steps.push({ step: 'validate', status: 'success', durationMs: Date.now() - validateStart });
+      } catch (error: any) {
+        output = (error.stdout || '') + (error.stderr || '');
+        steps.push({ step: 'validate', status: 'failed', durationMs: Date.now() - validateStart });
+
+        // Extract TypeScript errors
+        const errorLines = output.split('\n').filter((line: string) =>
+          line.includes('error TS') ||
+          line.includes('Error:') ||
+          line.includes('Module not found') ||
+          line.includes('Cannot find')
+        );
+        errorSummary = errorLines.slice(0, 15).join('\n');
       }
     } catch (error: any) {
-      // Sanitize error message
       errorSummary = sanitizeErrorMessage(error.message);
     } finally {
+      // Cleanup temp directory
       await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }
+
+    const totalDurationMs = Date.now() - startTime;
+    const emoji = success ? '✅' : '❌';
+    const modeLabel = validationMode === 'quick' ? 'Typecheck' : 'Full Build';
 
     return {
       content: [{
@@ -2012,11 +2062,16 @@ server.registerTool(
         text: JSON.stringify({
           repository: `${owner}/${repo}`,
           branch: branchName,
-          build_command: buildCmd,
+          mode: validationMode,
           success,
-          summary: success ? '✅ Build successful!' : '❌ Build failed',
+          summary: `${emoji} ${modeLabel} ${success ? 'passed' : 'failed'}`,
+          duration_ms: totalDurationMs,
+          steps,
           error_summary: errorSummary ? sanitizeErrorMessage(errorSummary) : null,
-          build_output: sanitizeErrorMessage(buildOutput.slice(-4000)),
+          output_tail: sanitizeErrorMessage(output.slice(-2000)),
+          tip: validationMode === 'quick' && !success
+            ? 'Run with mode="full" for complete build validation'
+            : null,
         }, null, 2),
       }],
     };
@@ -2176,7 +2231,7 @@ app.get('/health', (_req, res) => {
   const toolsetStats = toolsetManager.getStats();
   res.json({
     status: 'ok',
-    version: '4.3.0',
+    version: '4.3.1',
     toolsets: toolsetStats,
     cache: cache.getStats(),
     requestQueue: requestQueue.getStats(),
