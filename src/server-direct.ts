@@ -3010,6 +3010,22 @@ Quick mode is optimized for serverless timeouts and catches most TypeScript erro
 
       if (!response.ok) {
         const responseText = await response.text();
+        if (response.status === 404 || response.status === 422) {
+          return createSuccessOutput(
+            'Build workflow dispatch skipped',
+            {
+              repository: `${owner}/${repo}`,
+              branch: branchName,
+              mode: validationMode,
+              workflow: VALIDATE_BUILD_WORKFLOW,
+              ref: VALIDATE_BUILD_WORKFLOW_REF,
+              requested_at: requestedAt,
+              skipped: true,
+              reason: responseText,
+            },
+            'Workflow dispatch skipped. Ensure the workflow exists and supports workflow_dispatch.'
+          );
+        }
         parseGitHubError(response, response.url, responseText);
       }
 
