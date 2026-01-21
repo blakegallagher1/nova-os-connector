@@ -261,6 +261,7 @@ const SENSITIVE_PATTERNS = [
   /ghp_[a-zA-Z0-9]{36}/g,                    // GitHub PAT
   /ghs_[a-zA-Z0-9]{36}/g,                    // GitHub App token
   /github_pat_[a-zA-Z0-9_]{82}/g,            // Fine-grained PAT
+  /x-access-token:[^@]+@/gi,                 // Git HTTPS auth URL
   /sk-[a-zA-Z0-9]{48}/g,                     // OpenAI API key
   /Bearer\s+[a-zA-Z0-9._-]+/gi,              // Bearer tokens
   /Authorization:\s*[^\s]+/gi,               // Authorization headers
@@ -1967,7 +1968,10 @@ server.registerTool(
   async ({ owner, repo, branch, build_command }) => {
     const branchName = branch || 'main';
     const buildCmd = build_command || BUILD_COMMAND;
-    const repoUrl = `https://github.com/${owner}/${repo}.git`;
+    // Use authenticated HTTPS URL for private repos
+    const repoUrl = GITHUB_TOKEN
+      ? `https://x-access-token:${GITHUB_TOKEN}@github.com/${owner}/${repo}.git`
+      : `https://github.com/${owner}/${repo}.git`;
     const tempDir = path.join(os.tmpdir(), `validate-build-${Date.now()}`);
 
     let success = false;
