@@ -250,6 +250,8 @@ interface ConnectionState {
   isConnecting: boolean;
   lastError: string | null;
   reconnectAttempts: number;
+  lastToolsListAt: Date | null;
+  lastToolsListCount: number | null;
 }
 
 const state: ConnectionState = {
@@ -260,6 +262,8 @@ const state: ConnectionState = {
   isConnecting: false,
   lastError: null,
   reconnectAttempts: 0,
+  lastToolsListAt: null,
+  lastToolsListCount: null,
 };
 
 // ============================================================================
@@ -307,6 +311,11 @@ const rateLimitState: RateLimitState = {
   resetAt: null,
   lastChecked: null,
 };
+
+function getTotalToolCount(): number {
+  const customToolCount = 4 + (vercel ? 3 : 0); // batch_read_files, validate_build, check_github_rate_limit, clear_cache + vercel tools
+  return state.tools.length + customToolCount;
+}
 
 // Check if we're likely rate limited based on error message
 function isRateLimitError(error: Error): boolean {
@@ -451,7 +460,14 @@ async function connectToGitHub(): Promise<void> {
 
     // Fetch available tools
     const toolsResult = await state.client.listTools();
-    state.tools = toolsResult.tools || [];
+    const nextTools = toolsResult.tools || [];
+    if (nextTools.length > 0 || state.tools.length === 0) {
+      state.tools = nextTools;
+      state.lastToolsListAt = new Date();
+      state.lastToolsListCount = getTotalToolCount();
+    } else {
+      console.warn('[wrapper] listTools returned no tools; keeping last known tool registry');
+    }
 
     state.isConnected = true;
     state.reconnectAttempts = 0;
@@ -1359,13 +1375,14 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 app.get('/health', (_req, res) => {
-  const customToolCount = 4 + (vercel ? 3 : 0); // batch_read_files, validate_build, check_github_rate_limit, clear_cache + vercel tools
   const cacheStats = cache.getStats();
   res.json({
     status: state.isConnected ? 'ok' : 'degraded',
     connected: state.isConnected,
     connecting: state.isConnecting,
-    tools: state.tools.length + customToolCount,
+    tools: getTotalToolCount(),
+    lastToolsListAt: state.lastToolsListAt ? state.lastToolsListAt.toISOString() : null,
+    lastToolsListCount: state.lastToolsListCount,
     vercelEnabled: !!vercel,
     cache: {
       entries: cacheStats.entries,
@@ -1391,8 +1408,16 @@ app.post('/mcp', async (req, res) => {
       return;
     }
 
+    const method = req.body?.method as string | undefined;
+    const isDiscoveryCall = method === 'tools/list' || method === 'initialize';
+
+    if (method === 'tools/list') {
+      state.lastToolsListAt = new Date();
+      state.lastToolsListCount = getTotalToolCount();
+    }
+
     // Check connection before handling request
-    if (!state.isConnected && !state.isConnecting) {
+    if (!isDiscoveryCall && !state.isConnected && !state.isConnecting) {
       console.log('[wrapper] Connection lost, attempting reconnect...');
       await reconnectToGitHub();
     }

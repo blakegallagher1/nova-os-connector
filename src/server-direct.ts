@@ -3235,12 +3235,17 @@ if (VERCEL_TOKEN) {
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
+let lastToolsListAt: Date | null = null;
+let lastToolsListCount: number | null = null;
+
 app.get('/health', (_req, res) => {
   const toolsetStats = toolsetManager.getStats();
   res.json({
     status: 'ok',
     version: '4.3.2',
     toolsets: toolsetStats,
+    lastToolsListAt: lastToolsListAt ? lastToolsListAt.toISOString() : null,
+    lastToolsListCount,
     cache: cache.getStats(),
     requestQueue: requestQueue.getStats(),
     memory: process.memoryUsage(),
@@ -3260,6 +3265,12 @@ app.post('/mcp', async (req, res) => {
         result: { resources: [] },
       });
       return;
+    }
+
+    if (req.body?.method === 'tools/list') {
+      const stats = toolsetManager.getStats();
+      lastToolsListAt = new Date();
+      lastToolsListCount = stats.enabledTools;
     }
 
     const transport = new StreamableHTTPServerTransport({
