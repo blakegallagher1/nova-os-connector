@@ -13,6 +13,7 @@ import crypto from 'crypto';
 const PORT = parseInt(process.env.PORT || '8000', 10);
 const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
 const VERCEL_TOKEN = process.env.VERCEL_TOKEN;
+const VERCEL_TEAM_ID = process.env.VERCEL_TEAM_ID;
 
 // Configurable build command (defaults to 'npm run build')
 const BUILD_COMMAND = process.env.BUILD_COMMAND || 'npm run build';
@@ -3126,7 +3127,10 @@ registerTool(
 // Vercel API helper
 async function vercelAPI(endpoint: string, options: RequestInit = {}): Promise<any> {
   if (!VERCEL_TOKEN) throw new Error('VERCEL_TOKEN not configured');
-  const url = `https://api.vercel.com${endpoint}`;
+  const url = new URL(`https://api.vercel.com${endpoint}`);
+  if (VERCEL_TEAM_ID && !url.searchParams.has('teamId')) {
+    url.searchParams.set('teamId', VERCEL_TEAM_ID);
+  }
   const response = await fetch(url, {
     ...options,
     headers: {
@@ -3156,10 +3160,11 @@ if (VERCEL_TOKEN) {
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ projectId, limit }) => {
-      let url = `/v6/deployments?limit=${Math.min(limit || 10, 100)}`;
-      if (projectId) url += `&projectId=${projectId}`;
+      const url = new URL('/v6/deployments', 'https://api.vercel.com');
+      url.searchParams.set('limit', String(Math.min(limit || 10, 100)));
+      if (projectId) url.searchParams.set('projectId', projectId);
 
-      const response = await vercelAPI(url);
+      const response = await vercelAPI(`${url.pathname}${url.search}`);
 
       return {
         content: [{
@@ -3224,6 +3229,7 @@ app.get('/health', (_req, res) => {
     requestQueue: requestQueue.getStats(),
     memory: process.memoryUsage(),
     vercelEnabled: !!VERCEL_TOKEN,
+    vercelTeamId: VERCEL_TEAM_ID || null,
     buildCommand: BUILD_COMMAND,
     maxConcurrentRequests: MAX_CONCURRENT_REQUESTS,
   });
