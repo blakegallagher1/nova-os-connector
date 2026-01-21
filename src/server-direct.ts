@@ -1004,6 +1004,7 @@ async function appendAuditLog(entry: AuditLogEntry): Promise<void> {
  * This allows AI assistants to get both human-readable and machine-parseable output.
  */
 interface DualOutput {
+  [key: string]: unknown;
   /** Human-readable text content for display */
   content: Array<{ type: 'text'; text: string }>;
   /** Structured data for programmatic access (optional) */
@@ -1325,7 +1326,7 @@ function normalizeToolResult(toolName: string, result: DualOutput, durationMs: n
   };
 }
 
-function getAuditBase(toolName: string, args: Record<string, unknown>): AuditLogEntry {
+function getAuditBase(toolName: string, args: any): AuditLogEntry {
   const owner = typeof args.owner === 'string' ? args.owner : undefined;
   const repo = typeof args.repo === 'string' ? args.repo : undefined;
   return {
@@ -1339,7 +1340,7 @@ function getAuditBase(toolName: string, args: Record<string, unknown>): AuditLog
   };
 }
 
-function enforceAllowedRepo(args: Record<string, unknown>): void {
+function enforceAllowedRepo(args: any): void {
   const owner = typeof args.owner === 'string' ? args.owner : undefined;
   const repo = typeof args.repo === 'string' ? args.repo : undefined;
   if (!owner || !repo) return;
@@ -1352,9 +1353,9 @@ function enforceAllowedRepo(args: Record<string, unknown>): void {
 function registerTool(
   name: string,
   config: any,
-  handler: (args: Record<string, unknown>) => Promise<DualOutput>
+  handler: (args: any) => Promise<DualOutput>
 ): void {
-  server.registerTool(name, config, async (args: Record<string, unknown>) => {
+  server.registerTool(name, config, async (args: any) => {
     const auditEntry = getAuditBase(name, args);
     const limiter = getToolRateLimiter(name);
     if (limiter) {
