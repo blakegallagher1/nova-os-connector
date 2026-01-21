@@ -1,0 +1,53 @@
+name: Nova Validate Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      owner:
+        description: Repository owner (informational)
+        required: false
+        type: string
+      repo:
+        description: Repository name (informational)
+        required: false
+        type: string
+      branch:
+        description: Branch to validate
+        required: false
+        type: string
+      mode:
+        description: Validation mode (quick|full)
+        required: false
+        default: quick
+        type: choice
+        options:
+          - quick
+          - full
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || github.ref }}
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund || npm install --ignore-scripts --no-audit --no-fund
+
+      - name: Validate (quick)
+        if: ${{ inputs.mode == 'quick' }}
+        run: npx tsc --noEmit || npm run typecheck
+
+      - name: Validate (full)
+        if: ${{ inputs.mode == 'full' }}
+        run: npm run build

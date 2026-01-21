@@ -3,13 +3,8 @@ import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import * as fs from 'fs/promises';
-import * as os from 'os';
-import * as path from 'path';
-
-const execAsync = promisify(exec);
+import crypto from 'crypto';
 
 // ============================================================================
 // CONFIGURATION
@@ -25,8 +20,22 @@ const BUILD_COMMAND = process.env.BUILD_COMMAND || 'npm run build';
 // Request queue configuration
 const MAX_CONCURRENT_REQUESTS = parseInt(process.env.MAX_CONCURRENT_REQUESTS || '5', 10);
 
+// File size guardrails
+const MAX_FILE_BYTES = parseInt(process.env.MAX_FILE_BYTES || '4194304', 10); // 4MB default
+const ALLOW_BINARY_FILES = process.env.ALLOW_BINARY_FILES === 'true';
+
+// Validate build offloading
+const VALIDATE_BUILD_MODE = (process.env.VALIDATE_BUILD_MODE || 'worker').toLowerCase();
+const VALIDATE_BUILD_WORKER_URL = process.env.VALIDATE_BUILD_WORKER_URL;
+const VALIDATE_BUILD_WORKFLOW = process.env.VALIDATE_BUILD_WORKFLOW;
+const VALIDATE_BUILD_WORKFLOW_REF = process.env.VALIDATE_BUILD_WORKFLOW_REF || 'main';
+
 // Default enabled toolsets (can be overridden via env)
 const DEFAULT_ENABLED_TOOLSETS = (process.env.ENABLED_TOOLSETS || 'repos,issues,pulls,search,utility,vercel,toolsets').split(',').map(s => s.trim());
+const ALLOWED_REPOS = (process.env.ALLOWED_REPOS || 'blakegallagher1/nova-os')
+  .split(',')
+  .map((repo) => repo.trim().toLowerCase())
+  .filter(Boolean);
 
 if (!GITHUB_TOKEN) {
   console.error('ERROR: GITHUB_PERSONAL_ACCESS_TOKEN is required');
@@ -127,6 +136,17 @@ class ToolsetManager {
       if (toolset.tools.some(t => t.name === toolName)) {
         return toolset.enabled;
       }
+    }
+    return false;
+  }
+
+  /**
+   * Check if a specific tool is destructive.
+   */
+  isToolDestructive(toolName: string): boolean {
+    for (const toolset of this.toolsets.values()) {
+      const tool = toolset.tools.find(t => t.name === toolName);
+      if (tool) return tool.destructive;
     }
     return false;
   }
@@ -294,7 +314,7 @@ function sanitizeErrorMessage(message: string): string {
 /**
  * Creates a safe error response for returning to clients.
  */
-function createSafeErrorResponse(error: unknown, toolName: string): { content: Array<{ type: 'text'; text: string }> } {
+function createSafeErrorResponse(error: unknown, toolName: string): DualOutput {
   const rawMessage = error instanceof Error ? error.message : String(error);
   const sanitizedMessage = sanitizeErrorMessage(rawMessage);
 
@@ -319,23 +339,28 @@ function createSafeErrorResponse(error: unknown, toolName: string): { content: A
   } else if (error instanceof GitHubTimeoutError) {
     errorCode = 'TIMEOUT';
     retryable = true;
+  } else if (error instanceof ToolRateLimitError) {
+    errorCode = 'TOOL_RATE_LIMIT';
+    retryable = true;
+    retryAfter = Math.ceil(error.retryAfterMs / 1000);
   }
 
+  const payload = {
+    success: false,
+    error: true,
+    code: errorCode,
+    message: sanitizedMessage,
+    tool: toolName,
+    retryable,
+    ...(retryAfter !== undefined ? { retry_after_seconds: retryAfter } : {}),
+    suggestion: retryable
+      ? `The operation failed but may succeed if retried${retryAfter ? ` after ${retryAfter} seconds` : ''}.`
+      : 'The operation failed. You may need to try a different approach.',
+  };
+
   return {
-    content: [{
-      type: 'text' as const,
-      text: JSON.stringify({
-        error: true,
-        code: errorCode,
-        message: sanitizedMessage,
-        tool: toolName,
-        retryable,
-        ...(retryAfter !== undefined ? { retry_after_seconds: retryAfter } : {}),
-        suggestion: retryable
-          ? `The operation failed but may succeed if retried${retryAfter ? ` after ${retryAfter} seconds` : ''}.`
-          : 'The operation failed. You may need to try a different approach.',
-      }, null, 2),
-    }],
+    content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }],
+    structuredContent: payload,
   };
 }
 
@@ -447,6 +472,18 @@ class GitHubTimeoutError extends GitHubAPIError {
   ) {
     super(`Request to ${endpoint} timed out after ${timeoutMs}ms`, 408, endpoint);
     this.name = 'GitHubTimeoutError';
+  }
+}
+
+class ToolRateLimitError extends Error {
+  constructor(
+    public readonly toolName: string,
+    public readonly limit: number,
+    public readonly windowMs: number,
+    public readonly retryAfterMs: number
+  ) {
+    super(`Rate limit exceeded for ${toolName}. Limit: ${limit} per ${Math.round(windowMs / 1000)}s.`);
+    this.name = 'ToolRateLimitError';
   }
 }
 
@@ -741,17 +778,23 @@ async function githubAPI(
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 500;
+const CACHE_MAX_ENTRY_BYTES = parseInt(process.env.CACHE_MAX_ENTRY_BYTES || '1048576', 10); // 1MB
+const CACHE_MAX_TOTAL_BYTES = parseInt(process.env.CACHE_MAX_TOTAL_BYTES || '268435456', 10); // 256MB
+const CACHE_TTL_FILE_MS = parseInt(process.env.CACHE_TTL_FILE_MS || String(CACHE_TTL_MS), 10);
+const CACHE_TTL_BATCH_MS = parseInt(process.env.CACHE_TTL_BATCH_MS || String(CACHE_TTL_MS), 10);
 
 interface CacheEntry {
   data: any;
   timestamp: number;
   ttl: number;
   hits: number;
+  sizeBytes: number;
 }
 
 class ContentCache {
   private cache = new Map<string, CacheEntry>();
   private stats = { hits: 0, misses: 0, evictions: 0, invalidations: 0 };
+  private totalBytes = 0;
 
   fileKey(owner: string, repo: string, path: string, branch?: string): string {
     return `file:${owner}/${repo}/${branch || 'default'}:${path}`;
@@ -770,16 +813,31 @@ class ContentCache {
     return entry.data;
   }
 
-  set(key: string, data: any, ttl: number = CACHE_TTL_MS): void {
-    if (this.cache.size >= CACHE_MAX_ENTRIES) this.evictOldest();
-    this.cache.set(key, { data, timestamp: Date.now(), ttl, hits: 0 });
+  set(key: string, data: any, ttl: number = CACHE_TTL_MS): boolean {
+    const sizeBytes = this.estimateSize(data);
+    if (sizeBytes > CACHE_MAX_ENTRY_BYTES) {
+      return false;
+    }
+
+    while (this.cache.size >= CACHE_MAX_ENTRIES || this.totalBytes + sizeBytes > CACHE_MAX_TOTAL_BYTES) {
+      if (!this.evictOldest()) break;
+    }
+
+    this.cache.set(key, { data, timestamp: Date.now(), ttl, hits: 0, sizeBytes });
+    this.totalBytes += sizeBytes;
+    return true;
   }
 
   invalidateRepo(owner: string, repo: string): void {
     const prefix = `file:${owner}/${repo}/`;
     let count = 0;
     for (const key of this.cache.keys()) {
-      if (key.startsWith(prefix)) { this.cache.delete(key); count++; }
+      if (key.startsWith(prefix)) {
+        const entry = this.cache.get(key);
+        if (entry) this.totalBytes -= entry.sizeBytes;
+        this.cache.delete(key);
+        count++;
+      }
     }
     this.stats.invalidations += count;
   }
@@ -787,26 +845,155 @@ class ContentCache {
   clear(): number {
     const size = this.cache.size;
     this.cache.clear();
+    this.totalBytes = 0;
     return size;
   }
 
-  private evictOldest(): void {
+  private evictOldest(): boolean {
     let oldest: { key: string; timestamp: number } | null = null;
     for (const [key, entry] of this.cache.entries()) {
       if (!oldest || entry.timestamp < oldest.timestamp) oldest = { key, timestamp: entry.timestamp };
     }
-    if (oldest) { this.cache.delete(oldest.key); this.stats.evictions++; }
+    if (oldest) {
+      const entry = this.cache.get(oldest.key);
+      if (entry) this.totalBytes -= entry.sizeBytes;
+      this.cache.delete(oldest.key);
+      this.stats.evictions++;
+      return true;
+    }
+    return false;
   }
 
   getStats() {
     const hitRate = this.stats.hits + this.stats.misses > 0
       ? ((this.stats.hits / (this.stats.hits + this.stats.misses)) * 100).toFixed(1)
       : '0';
-    return { entries: this.cache.size, hitRate: `${hitRate}%`, ...this.stats };
+    return {
+      entries: this.cache.size,
+      hitRate: `${hitRate}%`,
+      totalBytes: this.totalBytes,
+      maxEntryBytes: CACHE_MAX_ENTRY_BYTES,
+      maxTotalBytes: CACHE_MAX_TOTAL_BYTES,
+      ...this.stats,
+    };
+  }
+
+  private estimateSize(data: any): number {
+    if (typeof data === 'string') {
+      return Buffer.byteLength(data, 'utf8');
+    }
+    try {
+      return Buffer.byteLength(JSON.stringify(data), 'utf8');
+    } catch {
+      return 0;
+    }
   }
 }
 
 const cache = new ContentCache();
+
+// ============================================================================
+// TOOL RATE LIMITING
+// ============================================================================
+
+interface ToolRateLimitConfig {
+  limit: number;
+  windowMs: number;
+}
+
+class ToolRateLimiter {
+  private windowStart = Date.now();
+  private count = 0;
+
+  constructor(private readonly config: ToolRateLimitConfig) {}
+
+  check(): { allowed: boolean; retryAfterMs: number } {
+    const now = Date.now();
+    if (now - this.windowStart >= this.config.windowMs) {
+      this.windowStart = now;
+      this.count = 0;
+    }
+
+    this.count += 1;
+    if (this.count > this.config.limit) {
+      const retryAfterMs = this.config.windowMs - (now - this.windowStart);
+      return { allowed: false, retryAfterMs: Math.max(0, retryAfterMs) };
+    }
+
+    return { allowed: true, retryAfterMs: 0 };
+  }
+}
+
+const DEFAULT_TOOL_RATE_LIMITS: Record<string, ToolRateLimitConfig> = {
+  batch_read_files: { limit: 30, windowMs: 60_000 },
+  push_files: { limit: 20, windowMs: 60_000 },
+  validate_build: { limit: 10, windowMs: 10 * 60_000 },
+  apply_patch: { limit: 50, windowMs: 60_000 },
+};
+
+const TOOL_RATE_LIMITS: Record<string, ToolRateLimitConfig> = (() => {
+  if (!process.env.TOOL_RATE_LIMITS) return DEFAULT_TOOL_RATE_LIMITS;
+  try {
+    const parsed = JSON.parse(process.env.TOOL_RATE_LIMITS) as Record<string, ToolRateLimitConfig>;
+    return { ...DEFAULT_TOOL_RATE_LIMITS, ...parsed };
+  } catch {
+    return DEFAULT_TOOL_RATE_LIMITS;
+  }
+})();
+
+const toolRateLimiters = new Map<string, ToolRateLimiter>();
+
+function getToolRateLimiter(toolName: string): ToolRateLimiter | null {
+  const config = TOOL_RATE_LIMITS[toolName];
+  if (!config) return null;
+  if (!toolRateLimiters.has(toolName)) {
+    toolRateLimiters.set(toolName, new ToolRateLimiter(config));
+  }
+  return toolRateLimiters.get(toolName)!;
+}
+
+// ============================================================================
+// AUDIT LOGGING
+// ============================================================================
+
+const AUDIT_LOG_MAX_ENTRIES = parseInt(process.env.AUDIT_LOG_MAX_ENTRIES || '1000', 10);
+const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH;
+const AUDIT_ALERT_DESTRUCTIVE = process.env.AUDIT_ALERT_DESTRUCTIVE === 'true';
+
+interface AuditLogEntry {
+  id: string;
+  tool: string;
+  timestamp: string;
+  durationMs?: number;
+  success?: boolean;
+  destructive?: boolean;
+  argsHash?: string;
+  repo?: string;
+  owner?: string;
+  error?: string;
+}
+
+const auditLog: AuditLogEntry[] = [];
+
+function hashArgs(args: Record<string, unknown>): string {
+  try {
+    return crypto.createHash('sha256').update(JSON.stringify(args)).digest('hex');
+  } catch {
+    return 'unhashable';
+  }
+}
+
+async function appendAuditLog(entry: AuditLogEntry): Promise<void> {
+  auditLog.push(entry);
+  if (auditLog.length > AUDIT_LOG_MAX_ENTRIES) {
+    auditLog.shift();
+  }
+
+  if (AUDIT_LOG_PATH) {
+    const line = JSON.stringify(entry) + '\n';
+    await fs.appendFile(AUDIT_LOG_PATH, line).catch(() => {});
+  }
+}
 
 // ============================================================================
 // DUAL OUTPUT FORMAT (Text + Structured)
@@ -1036,6 +1223,76 @@ function parseFilesInput(
   return parsed;
 }
 
+function isBinaryBuffer(buffer: Buffer): boolean {
+  const maxCheck = Math.min(buffer.length, 8192);
+  for (let i = 0; i < maxCheck; i += 1) {
+    if (buffer[i] === 0) return true;
+  }
+  return false;
+}
+
+function applyUnifiedDiff(original: string, patch: string): string {
+  const originalLines = original.split('\n');
+  const patchLines = patch.split('\n');
+  const result: string[] = [];
+  let cursor = 0;
+
+  let i = 0;
+  while (i < patchLines.length) {
+    const line = patchLines[i];
+    if (line.startsWith('---') || line.startsWith('+++')) {
+      i += 1;
+      continue;
+    }
+    if (!line.startsWith('@@')) {
+      i += 1;
+      continue;
+    }
+
+    const match = /@@\s+-([0-9]+)(?:,([0-9]+))?\s+\+([0-9]+)(?:,([0-9]+))?\s+@@/.exec(line);
+    if (!match) {
+      throw new Error('Invalid patch hunk header');
+    }
+
+    const startOld = parseInt(match[1], 10) - 1;
+    if (startOld < cursor) {
+      throw new Error('Patch hunk overlaps previous hunk');
+    }
+
+    result.push(...originalLines.slice(cursor, startOld));
+    cursor = startOld;
+    i += 1;
+
+    while (i < patchLines.length && !patchLines[i].startsWith('@@')) {
+      const hunkLine = patchLines[i];
+      if (hunkLine.startsWith('\\')) {
+        i += 1;
+        continue;
+      }
+      const marker = hunkLine[0];
+      const text = hunkLine.slice(1);
+      if (marker === ' ') {
+        if (originalLines[cursor] !== text) {
+          throw new Error(`Patch context mismatch at line ${cursor + 1}`);
+        }
+        result.push(originalLines[cursor]);
+        cursor += 1;
+      } else if (marker === '-') {
+        if (originalLines[cursor] !== text) {
+          throw new Error(`Patch removal mismatch at line ${cursor + 1}`);
+        }
+        cursor += 1;
+      } else if (marker === '+') {
+        result.push(text);
+      }
+      i += 1;
+    }
+  }
+
+  result.push(...originalLines.slice(cursor));
+  return result.join('\n');
+}
+
 // ============================================================================
 // MCP SERVER
 // ============================================================================
@@ -1045,6 +1302,95 @@ const server = new McpServer({
   version: '4.3.2',
   description: 'Direct GitHub API connector for Nova OS with dynamic toolsets',
 });
+
+function extractTextContent(content: Array<{ type: string; text?: string }>): string | null {
+  const texts = content
+    .filter((item) => item.type === 'text' && typeof item.text === 'string')
+    .map((item) => item.text as string);
+  if (texts.length === 0) return null;
+  return texts.join('\n');
+}
+
+function normalizeToolResult(toolName: string, result: DualOutput, durationMs: number): DualOutput {
+  const text = extractTextContent(result.content || []);
+  const structured = result.structuredContent ?? { text };
+  const normalizedStructured = {
+    success: structured.success ?? true,
+    tool: structured.tool ?? toolName,
+    ...structured,
+  };
+  return {
+    ...result,
+    structuredContent: { ...normalizedStructured, duration_ms: durationMs },
+  };
+}
+
+function getAuditBase(toolName: string, args: Record<string, unknown>): AuditLogEntry {
+  const owner = typeof args.owner === 'string' ? args.owner : undefined;
+  const repo = typeof args.repo === 'string' ? args.repo : undefined;
+  return {
+    id: crypto.randomUUID(),
+    tool: toolName,
+    timestamp: new Date().toISOString(),
+    destructive: toolsetManager.isToolDestructive(toolName),
+    argsHash: hashArgs(args),
+    owner,
+    repo,
+  };
+}
+
+function enforceAllowedRepo(args: Record<string, unknown>): void {
+  const owner = typeof args.owner === 'string' ? args.owner : undefined;
+  const repo = typeof args.repo === 'string' ? args.repo : undefined;
+  if (!owner || !repo) return;
+  const target = `${owner}/${repo}`.toLowerCase();
+  if (!ALLOWED_REPOS.includes(target)) {
+    throw new Error(`Repository not allowed: ${target}. Allowed: ${ALLOWED_REPOS.join(', ')}`);
+  }
+}
+
+function registerTool(
+  name: string,
+  config: any,
+  handler: (args: Record<string, unknown>) => Promise<DualOutput>
+): void {
+  server.registerTool(name, config, async (args: Record<string, unknown>) => {
+    const auditEntry = getAuditBase(name, args);
+    const limiter = getToolRateLimiter(name);
+    if (limiter) {
+      const decision = limiter.check();
+      if (!decision.allowed) {
+        const error = new ToolRateLimitError(name, TOOL_RATE_LIMITS[name].limit, TOOL_RATE_LIMITS[name].windowMs, decision.retryAfterMs);
+        const errorResult = createSafeErrorResponse(error, name);
+        auditEntry.success = false;
+        auditEntry.error = error.message;
+        await appendAuditLog(auditEntry);
+        return normalizeToolResult(name, errorResult, 0);
+      }
+    }
+
+    const start = Date.now();
+    try {
+      enforceAllowedRepo(args);
+      const result = await handler(args);
+      const normalized = normalizeToolResult(name, result, Date.now() - start);
+      auditEntry.success = true;
+      auditEntry.durationMs = Date.now() - start;
+      await appendAuditLog(auditEntry);
+      if (auditEntry.destructive && AUDIT_ALERT_DESTRUCTIVE) {
+        console.warn(`[audit] Destructive tool executed: ${name} (${auditEntry.owner || 'unknown'}/${auditEntry.repo || 'unknown'})`);
+      }
+      return normalized;
+    } catch (error) {
+      const errorResult = createSafeErrorResponse(error, name);
+      auditEntry.success = false;
+      auditEntry.durationMs = Date.now() - start;
+      auditEntry.error = error instanceof Error ? sanitizeErrorMessage(error.message) : 'Unknown error';
+      await appendAuditLog(auditEntry);
+      return normalizeToolResult(name, errorResult, auditEntry.durationMs);
+    }
+  });
+}
 
 // ============================================================================
 // REGISTER TOOLSETS
@@ -1058,7 +1404,10 @@ toolsetManager.registerToolset(
   [
     { name: 'get_file_contents', title: 'Get File Contents', description: 'Read a file from a repository', readOnly: true, destructive: false },
     { name: 'batch_read_files', title: 'Batch Read Files', description: 'Read multiple files in one call', readOnly: true, destructive: false },
+    { name: 'get_diff', title: 'Get Diff', description: 'Get diff between two refs', readOnly: true, destructive: false },
+    { name: 'suggest_changes', title: 'Suggest Changes', description: 'Summarize or suggest changes for a diff', readOnly: true, destructive: false },
     { name: 'create_or_update_file', title: 'Create or Update File', description: 'Create or update a single file', readOnly: false, destructive: true },
+    { name: 'apply_patch', title: 'Apply Patch', description: 'Apply a unified diff patch to a file', readOnly: false, destructive: true },
     { name: 'push_files', title: 'Push Files', description: 'Commit multiple files in one commit', readOnly: false, destructive: true },
     { name: 'create_branch', title: 'Create Branch', description: 'Create a new branch', readOnly: false, destructive: false },
     { name: 'list_commits', title: 'List Commits', description: 'List recent commits', readOnly: true, destructive: false },
@@ -1070,9 +1419,15 @@ toolsetManager.registerToolset(
 toolsetManager.registerToolset(
   'issues',
   'Issue tracking: list, filter, and manage issues',
-  true, // Currently read-only (only has list)
+  false,
   [
     { name: 'list_issues', title: 'List Issues', description: 'List issues in a repository', readOnly: true, destructive: false },
+    { name: 'get_issue', title: 'Get Issue', description: 'Get issue details', readOnly: true, destructive: false },
+    { name: 'search_issues', title: 'Search Issues', description: 'Search issues and PRs', readOnly: true, destructive: false },
+    { name: 'list_issue_comments', title: 'List Issue Comments', description: 'List comments on an issue', readOnly: true, destructive: false },
+    { name: 'create_issue', title: 'Create Issue', description: 'Create an issue', readOnly: false, destructive: true },
+    { name: 'update_issue', title: 'Update Issue', description: 'Update an issue', readOnly: false, destructive: true },
+    { name: 'add_issue_comment', title: 'Add Issue Comment', description: 'Comment on an issue', readOnly: false, destructive: true },
   ],
   DEFAULT_ENABLED_TOOLSETS.includes('issues')
 );
@@ -1084,7 +1439,14 @@ toolsetManager.registerToolset(
   false, // Has write operations
   [
     { name: 'create_pull_request', title: 'Create Pull Request', description: 'Create a new PR', readOnly: false, destructive: true },
+    { name: 'update_pull_request', title: 'Update Pull Request', description: 'Update a PR', readOnly: false, destructive: true },
     { name: 'get_pull_request', title: 'Get Pull Request', description: 'Get PR details', readOnly: true, destructive: false },
+    { name: 'list_pull_requests', title: 'List Pull Requests', description: 'List PRs in a repository', readOnly: true, destructive: false },
+    { name: 'get_pull_request_files', title: 'Get PR Files', description: 'List files in a PR', readOnly: true, destructive: false },
+    { name: 'get_pull_request_comments', title: 'Get PR Comments', description: 'List issue comments on a PR', readOnly: true, destructive: false },
+    { name: 'get_pull_request_reviews', title: 'Get PR Reviews', description: 'List reviews on a PR', readOnly: true, destructive: false },
+    { name: 'create_pull_request_review', title: 'Create PR Review', description: 'Create a PR review', readOnly: false, destructive: true },
+    { name: 'review_pr', title: 'Review PR', description: 'Summarize a PR for review', readOnly: true, destructive: false },
     { name: 'merge_pull_request', title: 'Merge Pull Request', description: 'Merge a PR', readOnly: false, destructive: true },
   ],
   DEFAULT_ENABLED_TOOLSETS.includes('pulls')
@@ -1097,6 +1459,7 @@ toolsetManager.registerToolset(
   true, // Read-only
   [
     { name: 'search_code', title: 'Search Code', description: 'Search for code patterns', readOnly: true, destructive: false },
+    { name: 'search_repositories', title: 'Search Repositories', description: 'Search repositories', readOnly: true, destructive: false },
   ],
   DEFAULT_ENABLED_TOOLSETS.includes('search')
 );
@@ -1147,7 +1510,7 @@ toolsetManager.registerToolset(
 // ============================================================================
 
 // list_toolsets
-server.registerTool(
+registerTool(
   'list_toolsets',
   {
     title: 'List Toolsets',
@@ -1185,7 +1548,7 @@ server.registerTool(
 );
 
 // get_toolset
-server.registerTool(
+registerTool(
   'get_toolset',
   {
     title: 'Get Toolset',
@@ -1237,7 +1600,7 @@ server.registerTool(
 );
 
 // enable_toolset
-server.registerTool(
+registerTool(
   'enable_toolset',
   {
     title: 'Enable Toolset',
@@ -1278,7 +1641,7 @@ server.registerTool(
 );
 
 // disable_toolset
-server.registerTool(
+registerTool(
   'disable_toolset',
   {
     title: 'Disable Toolset',
@@ -1323,7 +1686,7 @@ server.registerTool(
 // ============================================================================
 
 // get_file_contents
-server.registerTool(
+registerTool(
   'get_file_contents',
   {
     title: 'Get File Contents',
@@ -1352,14 +1715,21 @@ server.registerTool(
 
       let content: string;
       if (data.content) {
-        content = Buffer.from(data.content, 'base64').toString('utf-8');
+        if (typeof data.size === 'number' && data.size > MAX_FILE_BYTES) {
+          throw new Error(`File "${filePath}" exceeds max size (${data.size} bytes > ${MAX_FILE_BYTES} bytes)`);
+        }
+        const buffer = Buffer.from(data.content, 'base64');
+        if (!ALLOW_BINARY_FILES && isBinaryBuffer(buffer)) {
+          throw new Error(`File "${filePath}" appears to be binary. Set ALLOW_BINARY_FILES=true to allow.`);
+        }
+        content = buffer.toString('utf-8');
       } else if (Array.isArray(data)) {
         content = JSON.stringify(data.map((f: any) => ({ name: f.name, type: f.type, path: f.path })), null, 2);
       } else {
         content = JSON.stringify(data, null, 2);
       }
 
-      cache.set(cacheKey, content);
+      cache.set(cacheKey, content, CACHE_TTL_FILE_MS);
       return { content: [{ type: 'text' as const, text: content }] };
     } catch (error) {
       return createSafeErrorResponse(error, 'get_file_contents');
@@ -1368,7 +1738,7 @@ server.registerTool(
 );
 
 // batch_read_files
-server.registerTool(
+registerTool(
   'batch_read_files',
   {
     title: 'Batch Read Files',
@@ -1413,8 +1783,22 @@ server.registerTool(
           const data = await withConcurrencyLimit(() =>
             githubAPI(url, { timeoutMs: timeout_ms || DEFAULT_TIMEOUT_MS })
           );
-          const content = data.content ? Buffer.from(data.content, 'base64').toString('utf-8') : JSON.stringify(data);
-          cache.set(cacheKey, content);
+          if (data.content) {
+            if (typeof data.size === 'number' && data.size > MAX_FILE_BYTES) {
+              throw new Error(`File "${filePath}" exceeds max size (${data.size} bytes > ${MAX_FILE_BYTES} bytes)`);
+            }
+            const buffer = Buffer.from(data.content, 'base64');
+            if (!ALLOW_BINARY_FILES && isBinaryBuffer(buffer)) {
+              throw new Error(`File "${filePath}" appears to be binary. Set ALLOW_BINARY_FILES=true to allow.`);
+            }
+            const content = buffer.toString('utf-8');
+            cache.set(cacheKey, content, CACHE_TTL_BATCH_MS);
+            progress.success(filePath);
+            return { path: filePath, content, cached: false };
+          }
+
+          const content = JSON.stringify(data);
+          cache.set(cacheKey, content, CACHE_TTL_BATCH_MS);
           progress.success(filePath);
           return { path: filePath, content, cached: false };
         } catch (error: any) {
@@ -1453,8 +1837,189 @@ server.registerTool(
   }
 );
 
+// get_diff
+registerTool(
+  'get_diff',
+  {
+    title: 'Get Diff',
+    description: 'Get a diff between two refs in a repository. [Read-Only]',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      base: z.string().describe('Base ref (branch or SHA)'),
+      head: z.string().describe('Head ref (branch or SHA)'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  async ({ owner, repo, base, head }) => {
+    const compare = await githubAPI(`/repos/${owner}/${repo}/compare/${base}...${head}`);
+    const files = (compare.files || []).map((f: any) => ({
+      filename: f.filename,
+      status: f.status,
+      additions: f.additions,
+      deletions: f.deletions,
+      changes: f.changes,
+      patch: f.patch,
+    }));
+
+    return createDualOutput(`🧾 Diff ${base} → ${head} (${files.length} files)`, {
+      repository: `${owner}/${repo}`,
+      base,
+      head,
+      ahead_by: compare.ahead_by,
+      behind_by: compare.behind_by,
+      total_commits: compare.total_commits,
+      files,
+    });
+  }
+);
+
+// suggest_changes
+registerTool(
+  'suggest_changes',
+  {
+    title: 'Suggest Changes',
+    description: 'Summarize a diff and suggest review focus areas. [Read-Only]',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      base: z.string().optional().describe('Base ref'),
+      head: z.string().optional().describe('Head ref'),
+      diff: z.string().optional().describe('Unified diff text (optional)'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  async ({ owner, repo, base, head, diff }) => {
+    let files: Array<{ filename: string; additions: number; deletions: number }> = [];
+    let totalAdditions = 0;
+    let totalDeletions = 0;
+
+    if (diff) {
+      const lines = diff.split('\n');
+      let currentFile = '';
+      for (const line of lines) {
+        if (line.startsWith('+++ b/')) {
+          currentFile = line.replace('+++ b/', '');
+          if (!files.find(f => f.filename === currentFile)) {
+            files.push({ filename: currentFile, additions: 0, deletions: 0 });
+          }
+        } else if (line.startsWith('+') && !line.startsWith('+++')) {
+          totalAdditions += 1;
+          const file = files.find(f => f.filename === currentFile);
+          if (file) file.additions += 1;
+        } else if (line.startsWith('-') && !line.startsWith('---')) {
+          totalDeletions += 1;
+          const file = files.find(f => f.filename === currentFile);
+          if (file) file.deletions += 1;
+        }
+      }
+    } else if (base && head) {
+      const compare = await githubAPI(`/repos/${owner}/${repo}/compare/${base}...${head}`);
+      files = (compare.files || []).map((f: any) => ({
+        filename: f.filename,
+        additions: f.additions,
+        deletions: f.deletions,
+      }));
+      totalAdditions = compare.files.reduce((sum: number, f: any) => sum + f.additions, 0);
+      totalDeletions = compare.files.reduce((sum: number, f: any) => sum + f.deletions, 0);
+    } else {
+      throw new Error('Provide either diff or base/head refs.');
+    }
+
+    const suggestions: string[] = [];
+    if (totalAdditions + totalDeletions > 500) suggestions.push('Large change set; prioritize high-risk files.');
+    if (files.some(f => f.filename.includes('migrations') || f.filename.includes('schema'))) suggestions.push('Review schema/migration changes carefully.');
+    if (files.some(f => f.filename.endsWith('.env') || f.filename.includes('secret'))) suggestions.push('Check for secrets and configuration changes.');
+    if (suggestions.length === 0) suggestions.push('Standard review recommended.');
+
+    return createDualOutput('🧠 Suggested review focus areas', {
+      repository: `${owner}/${repo}`,
+      base,
+      head,
+      files,
+      totals: { additions: totalAdditions, deletions: totalDeletions },
+      suggestions,
+    });
+  }
+);
+
+// apply_patch
+registerTool(
+  'apply_patch',
+  {
+    title: 'Apply Patch',
+    description: 'Apply a unified diff patch to a file in a repository.',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      path: z.string().describe('File path to patch'),
+      patch: z.string().describe('Unified diff patch'),
+      branch: z.string().optional().describe('Branch name (optional)'),
+      message: z.string().optional().describe('Commit message'),
+    },
+    annotations: { destructiveHint: true },
+  },
+  async ({ owner, repo, path: filePath, patch, branch, message }) => {
+    try {
+      validateFilePath(filePath);
+      let url = `/repos/${owner}/${repo}/contents/${filePath}`;
+      if (branch) url += `?ref=${branch}`;
+
+      const data = await githubAPI(url);
+      if (!data.content || !data.sha) {
+        throw new Error('File content not found for patching');
+      }
+
+      if (typeof data.size === 'number' && data.size > MAX_FILE_BYTES) {
+        throw new Error(`File "${filePath}" exceeds max size (${data.size} bytes > ${MAX_FILE_BYTES} bytes)`);
+      }
+
+      const buffer = Buffer.from(data.content, 'base64');
+      if (!ALLOW_BINARY_FILES && isBinaryBuffer(buffer)) {
+        throw new Error(`File "${filePath}" appears to be binary. Set ALLOW_BINARY_FILES=true to allow.`);
+      }
+
+      const original = buffer.toString('utf-8');
+      const updated = applyUnifiedDiff(original, patch);
+
+      if (updated === original) {
+        throw new Error('Patch produced no changes');
+      }
+
+      if (Buffer.byteLength(updated, 'utf8') > MAX_FILE_BYTES) {
+        throw new Error(`Patched content exceeds max size (${MAX_FILE_BYTES} bytes)`);
+      }
+
+      const commitMessage = message || `Apply patch to ${filePath}`;
+      const result = await githubAPI(`/repos/${owner}/${repo}/contents/${filePath}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          message: commitMessage,
+          content: Buffer.from(updated).toString('base64'),
+          sha: data.sha,
+          ...(branch ? { branch } : {}),
+        }),
+      });
+
+      cache.invalidateRepo(owner, repo);
+
+      return createSuccessOutput('Patch applied', {
+        repository: `${owner}/${repo}`,
+        branch: branch || 'default',
+        file: filePath,
+        commit: {
+          sha: result.commit.sha,
+          url: result.commit.html_url,
+        },
+      });
+    } catch (error) {
+      return createSafeErrorResponse(error, 'apply_patch');
+    }
+  }
+);
+
 // create_or_update_file
-server.registerTool(
+registerTool(
   'create_or_update_file',
   {
     title: 'Create or Update File',
@@ -1544,7 +2109,7 @@ server.registerTool(
 );
 
 // push_files
-server.registerTool(
+registerTool(
   'push_files',
   {
     title: 'Push Files',
@@ -1694,7 +2259,7 @@ server.registerTool(
 );
 
 // list_issues
-server.registerTool(
+registerTool(
   'list_issues',
   {
     title: 'List Issues',
@@ -1704,34 +2269,223 @@ server.registerTool(
       repo: z.string().describe('Repository name'),
       state: z.enum(['open', 'closed', 'all']).optional().describe('Filter by state'),
       per_page: z.number().optional().describe('Results per page (max 100)'),
+      include_pull_requests: z.boolean().optional().describe('Include pull requests in results'),
     },
     annotations: { readOnlyHint: true, idempotentHint: true },
   },
-  async ({ owner, repo, state, per_page }) => {
+  async ({ owner, repo, state, per_page, include_pull_requests }) => {
     let url = `/repos/${owner}/${repo}/issues?`;
     if (state) url += `state=${state}&`;
     if (per_page) url += `per_page=${per_page}`;
 
     const issues = await githubAPI(url);
+    const filtered = include_pull_requests ? issues : issues.filter((i: any) => !i.pull_request);
+    const formatted = filtered.map((i: any) => ({
+      number: i.number,
+      title: i.title,
+      state: i.state,
+      user: i.user.login,
+      created_at: i.created_at,
+      updated_at: i.updated_at,
+      labels: i.labels.map((l: any) => l.name),
+      url: i.html_url,
+    }));
 
-    return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify(issues.map((i: any) => ({
-          number: i.number,
-          title: i.title,
-          state: i.state,
-          user: i.user.login,
-          created_at: i.created_at,
-          labels: i.labels.map((l: any) => l.name),
-        })), null, 2),
-      }],
-    };
+    const textSummary = `📋 ${formatted.length} issues in ${owner}/${repo}${state ? ` (${state})` : ''}`;
+    return createDualOutput(textSummary, {
+      repository: `${owner}/${repo}`,
+      state: state || 'open',
+      count: formatted.length,
+      issues: formatted,
+    });
+  }
+);
+
+// get_issue
+registerTool(
+  'get_issue',
+  {
+    title: 'Get Issue',
+    description: 'Get details for a GitHub issue. [Read-Only]',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      issue_number: z.number().describe('Issue number'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  async ({ owner, repo, issue_number }) => {
+    const issue = await githubAPI(`/repos/${owner}/${repo}/issues/${issue_number}`);
+    const textSummary = `🧾 Issue #${issue.number}: ${issue.title}`;
+    return createDualOutput(textSummary, {
+      number: issue.number,
+      title: issue.title,
+      state: issue.state,
+      user: issue.user.login,
+      assignees: issue.assignees.map((a: any) => a.login),
+      labels: issue.labels.map((l: any) => l.name),
+      created_at: issue.created_at,
+      updated_at: issue.updated_at,
+      body: issue.body,
+      url: issue.html_url,
+    });
+  }
+);
+
+// search_issues
+registerTool(
+  'search_issues',
+  {
+    title: 'Search Issues',
+    description: 'Search issues and pull requests. [Read-Only]',
+    inputSchema: {
+      query: z.string().describe('Search query (GitHub search syntax)'),
+      per_page: z.number().optional().describe('Results per page (max 100)'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  async ({ query, per_page }) => {
+    const q = encodeURIComponent(query);
+    const url = `/search/issues?q=${q}${per_page ? `&per_page=${per_page}` : ''}`;
+    const results = await githubAPI(url);
+    const formatted = results.items.map((i: any) => ({
+      number: i.number,
+      title: i.title,
+      state: i.state,
+      repository_url: i.repository_url,
+      url: i.html_url,
+      user: i.user?.login,
+      created_at: i.created_at,
+    }));
+    return createDualOutput(`🔎 Found ${formatted.length} results`, {
+      total_count: results.total_count,
+      items: formatted,
+    });
+  }
+);
+
+// list_issue_comments
+registerTool(
+  'list_issue_comments',
+  {
+    title: 'List Issue Comments',
+    description: 'List comments on an issue. [Read-Only]',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      issue_number: z.number().describe('Issue number'),
+      per_page: z.number().optional().describe('Results per page (max 100)'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  async ({ owner, repo, issue_number, per_page }) => {
+    const url = `/repos/${owner}/${repo}/issues/${issue_number}/comments${per_page ? `?per_page=${per_page}` : ''}`;
+    const comments = await githubAPI(url);
+    const formatted = comments.map((c: any) => ({
+      id: c.id,
+      user: c.user.login,
+      created_at: c.created_at,
+      body: c.body,
+      url: c.html_url,
+    }));
+    return createDualOutput(`💬 ${formatted.length} comments on #${issue_number}`, {
+      issue_number,
+      comments: formatted,
+    });
+  }
+);
+
+// create_issue
+registerTool(
+  'create_issue',
+  {
+    title: 'Create Issue',
+    description: 'Create a new issue.',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      title: z.string().describe('Issue title'),
+      body: z.string().optional().describe('Issue body'),
+      labels: z.array(z.string()).optional().describe('Labels'),
+      assignees: z.array(z.string()).optional().describe('Assignees'),
+    },
+    annotations: { destructiveHint: true },
+  },
+  async ({ owner, repo, title, body, labels, assignees }) => {
+    const issue = await githubAPI(`/repos/${owner}/${repo}/issues`, {
+      method: 'POST',
+      body: JSON.stringify({ title, body, labels, assignees }),
+    });
+    return createSuccessOutput('Issue created', {
+      number: issue.number,
+      title: issue.title,
+      state: issue.state,
+      url: issue.html_url,
+    });
+  }
+);
+
+// update_issue
+registerTool(
+  'update_issue',
+  {
+    title: 'Update Issue',
+    description: 'Update an existing issue.',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      issue_number: z.number().describe('Issue number'),
+      title: z.string().optional().describe('New title'),
+      body: z.string().optional().describe('New body'),
+      state: z.enum(['open', 'closed']).optional().describe('State'),
+      labels: z.array(z.string()).optional().describe('Labels'),
+      assignees: z.array(z.string()).optional().describe('Assignees'),
+    },
+    annotations: { destructiveHint: true },
+  },
+  async ({ owner, repo, issue_number, title, body, state, labels, assignees }) => {
+    const issue = await githubAPI(`/repos/${owner}/${repo}/issues/${issue_number}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title, body, state, labels, assignees }),
+    });
+    return createSuccessOutput('Issue updated', {
+      number: issue.number,
+      title: issue.title,
+      state: issue.state,
+      url: issue.html_url,
+    });
+  }
+);
+
+// add_issue_comment
+registerTool(
+  'add_issue_comment',
+  {
+    title: 'Add Issue Comment',
+    description: 'Add a comment to an issue.',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      issue_number: z.number().describe('Issue number'),
+      body: z.string().describe('Comment body'),
+    },
+    annotations: { destructiveHint: true },
+  },
+  async ({ owner, repo, issue_number, body }) => {
+    const comment = await githubAPI(`/repos/${owner}/${repo}/issues/${issue_number}/comments`, {
+      method: 'POST',
+      body: JSON.stringify({ body }),
+    });
+    return createSuccessOutput('Issue comment added', {
+      id: comment.id,
+      url: comment.html_url,
+      created_at: comment.created_at,
+    });
   }
 );
 
 // create_pull_request
-server.registerTool(
+registerTool(
   'create_pull_request',
   {
     title: 'Create Pull Request',
@@ -1752,24 +2506,85 @@ server.registerTool(
       body: JSON.stringify({ title, head, base, body }),
     });
 
-    return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify({
-          number: pr.number,
-          url: pr.html_url,
-          title: pr.title,
-          state: pr.state,
-          head: pr.head.ref,
-          base: pr.base.ref,
-        }, null, 2),
-      }],
-    };
+    return createSuccessOutput('Pull request created', {
+      number: pr.number,
+      url: pr.html_url,
+      title: pr.title,
+      state: pr.state,
+      head: pr.head.ref,
+      base: pr.base.ref,
+    });
+  }
+);
+
+// update_pull_request
+registerTool(
+  'update_pull_request',
+  {
+    title: 'Update Pull Request',
+    description: 'Update a pull request.',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      pull_number: z.number().describe('PR number'),
+      title: z.string().optional().describe('New title'),
+      body: z.string().optional().describe('New body'),
+      state: z.enum(['open', 'closed']).optional().describe('State'),
+    },
+    annotations: { destructiveHint: true },
+  },
+  async ({ owner, repo, pull_number, title, body, state }) => {
+    const pr = await githubAPI(`/repos/${owner}/${repo}/pulls/${pull_number}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title, body, state }),
+    });
+    return createSuccessOutput('Pull request updated', {
+      number: pr.number,
+      url: pr.html_url,
+      title: pr.title,
+      state: pr.state,
+    });
+  }
+);
+
+// list_pull_requests
+registerTool(
+  'list_pull_requests',
+  {
+    title: 'List Pull Requests',
+    description: 'List pull requests in a repository. [Read-Only]',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      state: z.enum(['open', 'closed', 'all']).optional().describe('Filter by state'),
+      per_page: z.number().optional().describe('Results per page (max 100)'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  async ({ owner, repo, state, per_page }) => {
+    let url = `/repos/${owner}/${repo}/pulls?`;
+    if (state) url += `state=${state}&`;
+    if (per_page) url += `per_page=${per_page}`;
+    const prs = await githubAPI(url);
+    const formatted = prs.map((pr: any) => ({
+      number: pr.number,
+      title: pr.title,
+      state: pr.state,
+      user: pr.user.login,
+      head: pr.head.ref,
+      base: pr.base.ref,
+      url: pr.html_url,
+    }));
+    return createDualOutput(`📌 ${formatted.length} pull requests in ${owner}/${repo}`, {
+      repository: `${owner}/${repo}`,
+      count: formatted.length,
+      pull_requests: formatted,
+    });
   }
 );
 
 // get_pull_request
-server.registerTool(
+registerTool(
   'get_pull_request',
   {
     title: 'Get Pull Request',
@@ -1784,27 +2599,189 @@ server.registerTool(
   async ({ owner, repo, pull_number }) => {
     const pr = await githubAPI(`/repos/${owner}/${repo}/pulls/${pull_number}`);
 
-    return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify({
-          number: pr.number,
-          title: pr.title,
-          state: pr.state,
-          merged: pr.merged,
-          mergeable: pr.mergeable,
-          head: pr.head.ref,
-          base: pr.base.ref,
-          user: pr.user.login,
-          url: pr.html_url,
-        }, null, 2),
-      }],
-    };
+    return createDualOutput(`🔍 PR #${pr.number}: ${pr.title}`, {
+      number: pr.number,
+      title: pr.title,
+      state: pr.state,
+      merged: pr.merged,
+      mergeable: pr.mergeable,
+      head: pr.head.ref,
+      base: pr.base.ref,
+      user: pr.user.login,
+      url: pr.html_url,
+    });
+  }
+);
+
+// get_pull_request_files
+registerTool(
+  'get_pull_request_files',
+  {
+    title: 'Get Pull Request Files',
+    description: 'List files in a pull request. [Read-Only]',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      pull_number: z.number().describe('PR number'),
+      per_page: z.number().optional().describe('Results per page (max 100)'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  async ({ owner, repo, pull_number, per_page }) => {
+    let url = `/repos/${owner}/${repo}/pulls/${pull_number}/files`;
+    if (per_page) url += `?per_page=${per_page}`;
+    const files = await githubAPI(url);
+    const formatted = files.map((f: any) => ({
+      filename: f.filename,
+      status: f.status,
+      additions: f.additions,
+      deletions: f.deletions,
+      changes: f.changes,
+      patch: f.patch,
+    }));
+    return createDualOutput(`📂 ${formatted.length} files in PR #${pull_number}`, {
+      pull_number,
+      files: formatted,
+    });
+  }
+);
+
+// get_pull_request_comments
+registerTool(
+  'get_pull_request_comments',
+  {
+    title: 'Get Pull Request Comments',
+    description: 'List issue comments on a pull request. [Read-Only]',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      pull_number: z.number().describe('PR number'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  async ({ owner, repo, pull_number }) => {
+    const comments = await githubAPI(`/repos/${owner}/${repo}/issues/${pull_number}/comments`);
+    const formatted = comments.map((c: any) => ({
+      id: c.id,
+      user: c.user.login,
+      created_at: c.created_at,
+      body: c.body,
+      url: c.html_url,
+    }));
+    return createDualOutput(`💬 ${formatted.length} comments on PR #${pull_number}`, {
+      pull_number,
+      comments: formatted,
+    });
+  }
+);
+
+// get_pull_request_reviews
+registerTool(
+  'get_pull_request_reviews',
+  {
+    title: 'Get Pull Request Reviews',
+    description: 'List reviews on a pull request. [Read-Only]',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      pull_number: z.number().describe('PR number'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  async ({ owner, repo, pull_number }) => {
+    const reviews = await githubAPI(`/repos/${owner}/${repo}/pulls/${pull_number}/reviews`);
+    const formatted = reviews.map((r: any) => ({
+      id: r.id,
+      user: r.user.login,
+      state: r.state,
+      submitted_at: r.submitted_at,
+      body: r.body,
+    }));
+    return createDualOutput(`🧾 ${formatted.length} reviews on PR #${pull_number}`, {
+      pull_number,
+      reviews: formatted,
+    });
+  }
+);
+
+// create_pull_request_review
+registerTool(
+  'create_pull_request_review',
+  {
+    title: 'Create Pull Request Review',
+    description: 'Create a review on a pull request.',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      pull_number: z.number().describe('PR number'),
+      body: z.string().optional().describe('Review body'),
+      event: z.enum(['APPROVE', 'REQUEST_CHANGES', 'COMMENT']).optional().describe('Review event'),
+      comments: z.array(z.object({
+        path: z.string().describe('File path'),
+        position: z.number().optional().describe('Position in diff'),
+        body: z.string().describe('Comment text'),
+      })).optional().describe('Inline comments'),
+    },
+    annotations: { destructiveHint: true },
+  },
+  async ({ owner, repo, pull_number, body, event, comments }) => {
+    const review = await githubAPI(`/repos/${owner}/${repo}/pulls/${pull_number}/reviews`, {
+      method: 'POST',
+      body: JSON.stringify({ body, event, comments }),
+    });
+    return createSuccessOutput('Review created', {
+      id: review.id,
+      state: review.state,
+      url: review.html_url,
+    });
+  }
+);
+
+// review_pr
+registerTool(
+  'review_pr',
+  {
+    title: 'Review Pull Request',
+    description: 'Summarize a pull request for review. [Read-Only]',
+    inputSchema: {
+      owner: z.string().describe('Repository owner'),
+      repo: z.string().describe('Repository name'),
+      pull_number: z.number().describe('PR number'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  async ({ owner, repo, pull_number }) => {
+    const pr = await githubAPI(`/repos/${owner}/${repo}/pulls/${pull_number}`);
+    const files = await githubAPI(`/repos/${owner}/${repo}/pulls/${pull_number}/files`);
+    const reviews = await githubAPI(`/repos/${owner}/${repo}/pulls/${pull_number}/reviews`);
+    const comments = await githubAPI(`/repos/${owner}/${repo}/issues/${pull_number}/comments`);
+
+    const fileSummary = files.map((f: any) => ({
+      filename: f.filename,
+      additions: f.additions,
+      deletions: f.deletions,
+      changes: f.changes,
+    }));
+
+    return createDualOutput(`🧩 Review summary for PR #${pull_number}`, {
+      pull_request: {
+        number: pr.number,
+        title: pr.title,
+        state: pr.state,
+        user: pr.user.login,
+        base: pr.base.ref,
+        head: pr.head.ref,
+        url: pr.html_url,
+      },
+      files: fileSummary,
+      reviews: reviews.map((r: any) => ({ id: r.id, user: r.user.login, state: r.state })),
+      comments: comments.map((c: any) => ({ id: c.id, user: c.user.login, created_at: c.created_at })),
+    });
   }
 );
 
 // merge_pull_request
-server.registerTool(
+registerTool(
   'merge_pull_request',
   {
     title: 'Merge Pull Request',
@@ -1825,21 +2802,16 @@ server.registerTool(
 
     cache.invalidateRepo(owner, repo);
 
-    return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify({
-          merged: result.merged,
-          message: result.message,
-          sha: result.sha?.slice(0, 7),
-        }, null, 2),
-      }],
-    };
+    return createSuccessOutput('Pull request merged', {
+      merged: result.merged,
+      message: result.message,
+      sha: result.sha?.slice(0, 7),
+    });
   }
 );
 
 // create_branch
-server.registerTool(
+registerTool(
   'create_branch',
   {
     title: 'Create Branch',
@@ -1878,7 +2850,7 @@ server.registerTool(
 );
 
 // search_code
-server.registerTool(
+registerTool(
   'search_code',
   {
     title: 'Search Code',
@@ -1895,25 +2867,48 @@ server.registerTool(
 
     const result = await githubAPI(url);
 
-    return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify({
-          total_count: result.total_count,
-          items: result.items.slice(0, 20).map((i: any) => ({
-            name: i.name,
-            path: i.path,
-            repository: i.repository.full_name,
-            url: i.html_url,
-          })),
-        }, null, 2),
-      }],
-    };
+    return createDualOutput(`🔎 Found ${result.items.length} code matches`, {
+      total_count: result.total_count,
+      items: result.items.slice(0, 20).map((i: any) => ({
+        name: i.name,
+        path: i.path,
+        repository: i.repository.full_name,
+        url: i.html_url,
+      })),
+    });
+  }
+);
+
+// search_repositories
+registerTool(
+  'search_repositories',
+  {
+    title: 'Search Repositories',
+    description: 'Search repositories. [Read-Only]',
+    inputSchema: {
+      q: z.string().describe('Search query'),
+      per_page: z.number().optional().describe('Results per page (max 100)'),
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  async ({ q, per_page }) => {
+    let url = `/search/repositories?q=${encodeURIComponent(q)}`;
+    if (per_page) url += `&per_page=${per_page}`;
+    const result = await githubAPI(url);
+    return createDualOutput(`📦 Found ${result.items.length} repositories`, {
+      total_count: result.total_count,
+      items: result.items.slice(0, 20).map((r: any) => ({
+        full_name: r.full_name,
+        description: r.description,
+        stars: r.stargazers_count,
+        url: r.html_url,
+      })),
+    });
   }
 );
 
 // list_commits
-server.registerTool(
+registerTool(
   'list_commits',
   {
     title: 'List Commits',
@@ -1952,7 +2947,7 @@ server.registerTool(
 // ============================================================================
 
 // validate_build
-server.registerTool(
+registerTool(
   'validate_build',
   {
     title: 'Validate Build',
@@ -1974,113 +2969,103 @@ Quick mode is optimized for serverless timeouts and catches most TypeScript erro
   async ({ owner, repo, branch, mode }) => {
     const branchName = branch || 'main';
     const validationMode = mode || 'quick';
-    const startTime = Date.now();
+    const requestedAt = new Date().toISOString();
 
-    // Use authenticated HTTPS URL for private repos
-    const repoUrl = GITHUB_TOKEN
-      ? `https://x-access-token:${GITHUB_TOKEN}@github.com/${owner}/${repo}.git`
-      : `https://github.com/${owner}/${repo}.git`;
-    const tempDir = path.join(os.tmpdir(), `validate-build-${Date.now()}`);
-
-    let success = false;
-    let errorSummary = '';
-    let output = '';
-    const steps: Array<{ step: string; status: string; durationMs?: number }> = [];
-
-    try {
-      await fs.mkdir(tempDir, { recursive: true });
-
-      // Step 1: Clone (shallow, single branch for speed)
-      const cloneStart = Date.now();
-      try {
-        await execAsync(
-          `git clone --depth 1 --single-branch --branch ${branchName} ${repoUrl} .`,
-          { cwd: tempDir, timeout: 30000 }
-        );
-        steps.push({ step: 'clone', status: 'success', durationMs: Date.now() - cloneStart });
-      } catch (error: any) {
-        steps.push({ step: 'clone', status: 'failed', durationMs: Date.now() - cloneStart });
-        throw new Error(`Clone failed: ${error.message}`);
-      }
-
-      // Step 2: Install dependencies (fast mode with ignore-scripts)
-      const installStart = Date.now();
-      try {
-        // Use npm ci with flags for speed: ignore scripts, prefer offline cache
-        // 120s timeout for monorepos with many packages
-        await execAsync(
-          'npm ci --ignore-scripts --prefer-offline --no-audit --no-fund 2>&1 || npm install --ignore-scripts --prefer-offline --no-audit --no-fund 2>&1',
-          { cwd: tempDir, timeout: 120000 }
-        );
-        steps.push({ step: 'install', status: 'success', durationMs: Date.now() - installStart });
-      } catch (error: any) {
-        steps.push({ step: 'install', status: 'failed', durationMs: Date.now() - installStart });
-        throw new Error(`Install failed: ${error.message}`);
-      }
-
-      // Step 3: Validate (typecheck or full build based on mode)
-      const validateStart = Date.now();
-      const validateCmd = validationMode === 'quick'
-        ? 'npx tsc --noEmit 2>&1 || npm run typecheck 2>&1'
-        : `${BUILD_COMMAND} 2>&1`;
-
-      try {
-        const result = await execAsync(validateCmd, {
-          cwd: tempDir,
-          timeout: validationMode === 'quick' ? 45000 : 120000,
-          maxBuffer: 5 * 1024 * 1024,
-        });
-        output = (result.stdout || '') + (result.stderr || '');
-        success = true;
-        steps.push({ step: 'validate', status: 'success', durationMs: Date.now() - validateStart });
-      } catch (error: any) {
-        output = (error.stdout || '') + (error.stderr || '');
-        steps.push({ step: 'validate', status: 'failed', durationMs: Date.now() - validateStart });
-
-        // Extract TypeScript errors
-        const errorLines = output.split('\n').filter((line: string) =>
-          line.includes('error TS') ||
-          line.includes('Error:') ||
-          line.includes('Module not found') ||
-          line.includes('Cannot find')
-        );
-        errorSummary = errorLines.slice(0, 15).join('\n');
-      }
-    } catch (error: any) {
-      errorSummary = sanitizeErrorMessage(error.message);
-    } finally {
-      // Cleanup temp directory
-      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    if (VALIDATE_BUILD_MODE === 'disabled') {
+      return createSafeErrorResponse(new Error('validate_build is disabled in this environment'), 'validate_build');
     }
 
-    const totalDurationMs = Date.now() - startTime;
-    const emoji = success ? '✅' : '❌';
-    const modeLabel = validationMode === 'quick' ? 'Typecheck' : 'Full Build';
+    if (VALIDATE_BUILD_MODE === 'actions') {
+      if (!VALIDATE_BUILD_WORKFLOW) {
+        return createSafeErrorResponse(new Error('VALIDATE_BUILD_WORKFLOW is not configured'), 'validate_build');
+      }
 
-    return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify({
-          repository: `${owner}/${repo}`,
+      const dispatchPayload = {
+        ref: VALIDATE_BUILD_WORKFLOW_REF,
+        inputs: {
+          owner,
+          repo,
           branch: branchName,
           mode: validationMode,
-          success,
-          summary: `${emoji} ${modeLabel} ${success ? 'passed' : 'failed'}`,
-          duration_ms: totalDurationMs,
-          steps,
-          error_summary: errorSummary ? sanitizeErrorMessage(errorSummary) : null,
-          output_tail: sanitizeErrorMessage(output.slice(-2000)),
-          tip: validationMode === 'quick' && !success
-            ? 'Run with mode="full" for complete build validation'
-            : null,
-        }, null, 2),
-      }],
-    };
+          requested_at: requestedAt,
+        },
+      };
+
+      const response = await fetchWithTimeout(
+        `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${VALIDATE_BUILD_WORKFLOW}/dispatches`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${GITHUB_TOKEN}`,
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(dispatchPayload),
+        },
+        DEFAULT_TIMEOUT_MS
+      );
+
+      if (!response.ok) {
+        const responseText = await response.text();
+        parseGitHubError(response, response.url, responseText);
+      }
+
+      return createSuccessOutput('Build queued via GitHub Actions', {
+        repository: `${owner}/${repo}`,
+        branch: branchName,
+        mode: validationMode,
+        workflow: VALIDATE_BUILD_WORKFLOW,
+        ref: VALIDATE_BUILD_WORKFLOW_REF,
+        requested_at: requestedAt,
+      }, 'Workflow dispatch created. Check Actions in the target repo for status.');
+    }
+
+    if (!VALIDATE_BUILD_WORKER_URL) {
+      return createSafeErrorResponse(new Error('VALIDATE_BUILD_WORKER_URL is not configured'), 'validate_build');
+    }
+
+    const response = await fetchWithTimeout(
+      VALIDATE_BUILD_WORKER_URL,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          owner,
+          repo,
+          branch: branchName,
+          mode: validationMode,
+          requested_at: requestedAt,
+        }),
+      },
+      DEFAULT_TIMEOUT_MS
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Worker enqueue failed: ${errorText || response.status}`);
+    }
+
+    let payload: any = {};
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { message: 'Build request accepted' };
+    }
+
+    return createSuccessOutput('Build queued', {
+      repository: `${owner}/${repo}`,
+      branch: branchName,
+      mode: validationMode,
+      requested_at: requestedAt,
+      worker: VALIDATE_BUILD_WORKER_URL,
+      job: payload,
+    }, payload.message || 'Worker accepted the build request.');
   }
 );
 
 // check_github_rate_limit
-server.registerTool(
+registerTool(
   'check_github_rate_limit',
   {
     title: 'Check GitHub Rate Limit',
@@ -2108,7 +3093,7 @@ server.registerTool(
 );
 
 // clear_cache
-server.registerTool(
+registerTool(
   'clear_cache',
   {
     title: 'Clear Cache',
@@ -2158,7 +3143,7 @@ async function vercelAPI(endpoint: string, options: RequestInit = {}): Promise<a
 
 // Vercel tools
 if (VERCEL_TOKEN) {
-  server.registerTool(
+  registerTool(
     'list_vercel_deployments',
     {
       title: 'List Vercel Deployments',
@@ -2193,7 +3178,7 @@ if (VERCEL_TOKEN) {
     }
   );
 
-  server.registerTool(
+  registerTool(
     'get_vercel_deployment',
     {
       title: 'Get Vercel Deployment',
@@ -2236,6 +3221,7 @@ app.get('/health', (_req, res) => {
     toolsets: toolsetStats,
     cache: cache.getStats(),
     requestQueue: requestQueue.getStats(),
+    memory: process.memoryUsage(),
     vercelEnabled: !!VERCEL_TOKEN,
     buildCommand: BUILD_COMMAND,
     maxConcurrentRequests: MAX_CONCURRENT_REQUESTS,

@@ -472,7 +472,10 @@ describe('Toolset Integration', () => {
       [
         { name: 'get_file_contents', title: 'Get File Contents', description: 'Read a file', readOnly: true, destructive: false },
         { name: 'batch_read_files', title: 'Batch Read Files', description: 'Read multiple files', readOnly: true, destructive: false },
+        { name: 'get_diff', title: 'Get Diff', description: 'Diff refs', readOnly: true, destructive: false },
+        { name: 'suggest_changes', title: 'Suggest Changes', description: 'Suggest changes', readOnly: true, destructive: false },
         { name: 'create_or_update_file', title: 'Create or Update File', description: 'Write a file', readOnly: false, destructive: true },
+        { name: 'apply_patch', title: 'Apply Patch', description: 'Apply patch', readOnly: false, destructive: true },
         { name: 'push_files', title: 'Push Files', description: 'Commit multiple files', readOnly: false, destructive: true },
         { name: 'create_branch', title: 'Create Branch', description: 'Create branch', readOnly: false, destructive: false },
         { name: 'list_commits', title: 'List Commits', description: 'List commits', readOnly: true, destructive: false },
@@ -483,8 +486,16 @@ describe('Toolset Integration', () => {
     manager.registerToolset(
       'issues',
       'Issue tracking',
-      true,
-      [{ name: 'list_issues', title: 'List Issues', description: 'List issues', readOnly: true, destructive: false }],
+      false,
+      [
+        { name: 'list_issues', title: 'List Issues', description: 'List issues', readOnly: true, destructive: false },
+        { name: 'get_issue', title: 'Get Issue', description: 'Get issue', readOnly: true, destructive: false },
+        { name: 'search_issues', title: 'Search Issues', description: 'Search issues', readOnly: true, destructive: false },
+        { name: 'list_issue_comments', title: 'List Issue Comments', description: 'List comments', readOnly: true, destructive: false },
+        { name: 'create_issue', title: 'Create Issue', description: 'Create issue', readOnly: false, destructive: true },
+        { name: 'update_issue', title: 'Update Issue', description: 'Update issue', readOnly: false, destructive: true },
+        { name: 'add_issue_comment', title: 'Add Issue Comment', description: 'Add comment', readOnly: false, destructive: true },
+      ],
       true
     );
 
@@ -494,8 +505,38 @@ describe('Toolset Integration', () => {
       false,
       [
         { name: 'create_pull_request', title: 'Create PR', description: 'Create PR', readOnly: false, destructive: true },
+        { name: 'update_pull_request', title: 'Update PR', description: 'Update PR', readOnly: false, destructive: true },
         { name: 'get_pull_request', title: 'Get PR', description: 'Get PR details', readOnly: true, destructive: false },
+        { name: 'list_pull_requests', title: 'List PRs', description: 'List PRs', readOnly: true, destructive: false },
+        { name: 'get_pull_request_files', title: 'Get PR Files', description: 'Get PR files', readOnly: true, destructive: false },
+        { name: 'get_pull_request_comments', title: 'Get PR Comments', description: 'Get PR comments', readOnly: true, destructive: false },
+        { name: 'get_pull_request_reviews', title: 'Get PR Reviews', description: 'Get PR reviews', readOnly: true, destructive: false },
+        { name: 'create_pull_request_review', title: 'Create PR Review', description: 'Create PR review', readOnly: false, destructive: true },
+        { name: 'review_pr', title: 'Review PR', description: 'Review PR', readOnly: true, destructive: false },
         { name: 'merge_pull_request', title: 'Merge PR', description: 'Merge PR', readOnly: false, destructive: true },
+      ],
+      true
+    );
+
+    manager.registerToolset(
+      'search',
+      'Search tools',
+      true,
+      [
+        { name: 'search_code', title: 'Search Code', description: 'Search code', readOnly: true, destructive: false },
+        { name: 'search_repositories', title: 'Search Repos', description: 'Search repos', readOnly: true, destructive: false },
+      ],
+      true
+    );
+
+    manager.registerToolset(
+      'utility',
+      'Utility tools',
+      false,
+      [
+        { name: 'validate_build', title: 'Validate Build', description: 'Validate build', readOnly: true, destructive: false },
+        { name: 'check_github_rate_limit', title: 'Check Rate Limit', description: 'Check rate limit', readOnly: true, destructive: false },
+        { name: 'clear_cache', title: 'Clear Cache', description: 'Clear cache', readOnly: false, destructive: false },
       ],
       true
     );
@@ -516,22 +557,22 @@ describe('Toolset Integration', () => {
 
   it('should have all expected toolsets registered', () => {
     const toolsets = manager.getAllToolsets();
-    expect(toolsets.map(ts => ts.name)).toEqual(['repos', 'issues', 'pulls', 'toolsets']);
+    expect(toolsets.map(ts => ts.name)).toEqual(['repos', 'issues', 'pulls', 'search', 'utility', 'toolsets']);
   });
 
   it('should correctly count tools across toolsets', () => {
     const stats = manager.getStats();
-    expect(stats.totalToolsets).toBe(4);
-    expect(stats.totalTools).toBe(14); // 6 + 1 + 3 + 4
-    expect(stats.enabledToolsets).toBe(4);
-    expect(stats.enabledTools).toBe(14);
+    expect(stats.totalToolsets).toBe(6);
+    expect(stats.totalTools).toBe(35); // 9 + 7 + 10 + 2 + 3 + 4
+    expect(stats.enabledToolsets).toBe(6);
+    expect(stats.enabledTools).toBe(35);
   });
 
   it('should disable repos toolset and update counts', () => {
     manager.disableToolset('repos');
     const stats = manager.getStats();
-    expect(stats.enabledToolsets).toBe(3);
-    expect(stats.enabledTools).toBe(8); // 14 - 6
+    expect(stats.enabledToolsets).toBe(5);
+    expect(stats.enabledTools).toBe(26); // 35 - 9
     expect(manager.isToolEnabled('get_file_contents')).toBe(false);
     expect(manager.isToolEnabled('list_issues')).toBe(true);
   });
@@ -548,7 +589,7 @@ describe('Toolset Integration', () => {
     const issues = toolsets.find(ts => ts.name === 'issues')!;
     const repos = toolsets.find(ts => ts.name === 'repos')!;
 
-    expect(issues.readOnly).toBe(true);
+    expect(issues.readOnly).toBe(false);
     expect(repos.readOnly).toBe(false);
   });
 
@@ -557,7 +598,7 @@ describe('Toolset Integration', () => {
     const destructiveTools = reposTools.filter(t => t.destructive);
     const nonDestructiveTools = reposTools.filter(t => !t.destructive);
 
-    expect(destructiveTools.map(t => t.name)).toEqual(['create_or_update_file', 'push_files']);
-    expect(nonDestructiveTools.map(t => t.name)).toEqual(['get_file_contents', 'batch_read_files', 'create_branch', 'list_commits']);
+    expect(destructiveTools.map(t => t.name)).toEqual(['create_or_update_file', 'apply_patch', 'push_files']);
+    expect(nonDestructiveTools.map(t => t.name)).toEqual(['get_file_contents', 'batch_read_files', 'get_diff', 'suggest_changes', 'create_branch', 'list_commits']);
   });
 });

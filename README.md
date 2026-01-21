@@ -141,3 +141,51 @@ ChatGPT → Cloudflare Tunnel → localhost:8000 → mcp-proxy → GitHub MCP (s
 - **"Authentication failed"**: Check `GITHUB_PERSONAL_ACCESS_TOKEN` is set
 - **"Tool not found"**: Refresh the connector in ChatGPT settings
 - **Read operations slow**: Switch to v3 wrapper with tool annotations
+
+## Validate Build via GitHub Actions (Recommended)
+
+The `validate_build` tool now supports offloading to GitHub Actions to avoid memory spikes on Render.
+
+1) Copy this workflow into each target repo you want to validate:
+- `nova-os-connector/.github/workflows/nova-validate-build.yml`
+
+2) Set these env vars on the connector:
+```bash
+VALIDATE_BUILD_MODE=actions
+VALIDATE_BUILD_WORKFLOW=nova-validate-build.yml
+VALIDATE_BUILD_WORKFLOW_REF=main
+```
+
+3) Ensure the GitHub token used by the connector has `workflow` permission (or `actions:write` for fine‑grained PATs).
+
+## Repository Allowlist (Required)
+
+This connector is locked to a specific repo by default:
+
+```bash
+ALLOWED_REPOS=blakegallagher1/nova-os
+```
+
+Provide a comma‑separated list to expand access.
+
+## Performance Tuning Defaults (Aggressive)
+
+These defaults are tuned for heavy usage. Override via env vars as needed:
+
+```bash
+MAX_FILE_BYTES=4194304            # 4MB
+CACHE_MAX_ENTRY_BYTES=1048576     # 1MB
+CACHE_MAX_TOTAL_BYTES=268435456   # 256MB
+CACHE_TTL_FILE_MS=300000          # 5 min
+CACHE_TTL_BATCH_MS=300000         # 5 min
+```
+
+Tool rate limits (override via `TOOL_RATE_LIMITS` JSON):
+```bash
+TOOL_RATE_LIMITS='{
+  "batch_read_files": {"limit": 30, "windowMs": 60000},
+  "push_files": {"limit": 20, "windowMs": 60000},
+  "apply_patch": {"limit": 50, "windowMs": 60000},
+  "validate_build": {"limit": 10, "windowMs": 600000}
+}'
+```

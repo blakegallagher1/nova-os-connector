@@ -3,7 +3,7 @@ services:
     name: nova-os-connector
     runtime: node
     region: oregon
-    plan: starter
+    plan: standard
     buildCommand: npm install
     startCommand: npm start
     envVars:
@@ -11,6 +11,20 @@ services:
         value: production
       - key: PORT
         value: 8000
+      - key: MAX_FILE_BYTES
+        value: 4194304
+      - key: CACHE_MAX_ENTRY_BYTES
+        value: 1048576
+      - key: CACHE_MAX_TOTAL_BYTES
+        value: 268435456
+      - key: CACHE_TTL_FILE_MS
+        value: 300000
+      - key: CACHE_TTL_BATCH_MS
+        value: 300000
+      - key: ALLOWED_REPOS
+        value: blakegallagher1/nova-os
+      - key: TOOL_RATE_LIMITS
+        value: '{"batch_read_files":{"limit":30,"windowMs":60000},"push_files":{"limit":20,"windowMs":60000},"apply_patch":{"limit":50,"windowMs":60000},"validate_build":{"limit":10,"windowMs":600000}}'
       - key: GITHUB_PERSONAL_ACCESS_TOKEN
         sync: false
       - key: VERCEL_TOKEN
